@@ -22,6 +22,8 @@ from model_price_watcher.storage import (
     get_latest_successful_snapshot,
     get_offering_history,
     get_snapshot_observations,
+    get_successful_history,
+    get_successful_snapshots,
     open_database,
     write_snapshot,
 )
@@ -1257,6 +1259,98 @@ class StorageTests(unittest.TestCase):
                 connection.close()
             except sqlite3.Error:
                 pass
+
+    def test_successful_snapshots_query(self):
+        self.assertEqual(get_successful_history(self.connection, "openrouter"), ())
+        with self.assertRaises(TypeError):
+            get_successful_history(self.connection, None)
+        self.assertEqual(get_successful_snapshots(self.connection, "openrouter"), ())
+        with self.assertRaises(TypeError):
+            get_successful_snapshots(self.connection, None)
+
+        first = self.write((self.observation("one"),))
+        newer = self.write(
+            (self.observation("two", observed_at=datetime(2026, 9, 19, 13, 30, tzinfo=timezone.utc)),),
+            started_at=COMPLETED, completed_at=LATER,
+        )
+        backfill = self.write(
+            (self.observation("backfill", observed_at=datetime(2026, 9, 19, 11, 30, tzinfo=timezone.utc)),),
+            started_at=EARLIER, completed_at=STARTED,
+        )
+        tied_source = SourceMetadata("fixture:openrouter", {"capture": "tied"})
+        tied = write_snapshot(
+            self.connection,
+            provider="openrouter",
+            started_at=STARTED,
+            completed_at=LATER,
+            source=tied_source,
+            observations=(self.observation("tied", source=tied_source, observed_at=OBSERVED),),
+        )
+        empty = self.write((), started_at=LATER, completed_at=LATER + timedelta(minutes=1))
+        other_source = SourceMetadata("other", {})
+        other = write_snapshot(
+            self.connection,
+            provider="OtherProvider",
+            started_at=LATER,
+            completed_at=LATER,
+            source=other_source,
+            observations=(
+                self.observation(
+                    "two", provider="OtherProvider", source=other_source, observed_at=LATER,
+                ),
+            ),
+        )
+
+        openrouter = get_successful_snapshots(self.connection, "openrouter")
+        self.assertEqual(
+            [row.id for row in openrouter],
+            [backfill.id, first.id, newer.id, tied.id, empty.id],
+        )
+        self.assertEqual(get_snapshot_observations(self.connection, empty.id), ())
+        self.assertEqual(
+            [row.id for row in get_successful_snapshots(self.connection, "OtherProvider")],
+            [other.id],
+        )
+        self.assertEqual(get_successful_snapshots(self.connection, "OpenRouter"), ())
+        self.assertIsInstance(openrouter, tuple)
+        self.assertIsInstance(openrouter[0], SnapshotRecord)
+
+        self.assertEqual(
+            get_successful_history(self.connection, "openrouter"),
+            tuple((snapshot, get_snapshot_observations(self.connection, snapshot.id))
+                  for snapshot in openrouter),
+        )
+        self.assertEqual(get_successful_history(self.connection, "OpenRouter"), ())
+        self.assertEqual(
+            get_successful_history(self.connection, "OtherProvider"),
+            ((other, get_snapshot_observations(self.connection, other.id)),),
+        )
+
+        good = self.write((self.observation("good"),), completed_at=LATER + timedelta(hours=2))
+        self.connection.execute(
+            "UPDATE snapshots SET started_at = '2026-09-19T12:00:00Z' WHERE id = ?",
+            (good.id,),
+        )
+        with self.assertRaises(StorageError):
+            get_successful_snapshots(self.connection, "openrouter")
+        with self.assertRaises(StorageError):
+            get_successful_history(self.connection, "openrouter")
+        self.assertEqual(
+            [row.id for row in get_successful_snapshots(self.connection, "OtherProvider")],
+            [other.id],
+        )
+
+    def test_successful_history_observation_order_and_decoding(self):
+        snapshot = self.write(tuple(self.observation(identity) for identity in ("z", "a", "A")))
+        history = get_successful_history(self.connection, "openrouter")
+        self.assertEqual(history, ((snapshot, get_snapshot_observations(self.connection, snapshot.id)),))
+        self.assertEqual([row.offering_id for row in history[0][1]], ["A", "a", "z"])
+        self.connection.execute(
+            "UPDATE observations SET input_per_million = 'bad' WHERE snapshot_id = ?",
+            (snapshot.id,),
+        )
+        with self.assertRaises(StorageError):
+            get_successful_history(self.connection, "openrouter")
 
 
 if __name__ == "__main__":

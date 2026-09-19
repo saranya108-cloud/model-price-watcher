@@ -238,6 +238,49 @@ def get_latest_successful_snapshot(
     return _snapshot_from_row(row)
 
 
+def get_successful_snapshots(
+    connection: sqlite3.Connection, provider: str,
+) -> tuple[SnapshotRecord, ...]:
+    """Return every successful snapshot for an exact provider, oldest first."""
+    _require_identity(provider, "provider")
+    rows = connection.execute(
+        "SELECT * FROM snapshots "
+        "WHERE provider = ? "
+        "ORDER BY completed_at ASC, id ASC",
+        (provider,),
+    ).fetchall()
+    return tuple(_snapshot_from_row(row) for row in rows)
+
+
+def get_successful_history(
+    connection: sqlite3.Connection, provider: str,
+) -> tuple[tuple[SnapshotRecord, tuple[ObservationRecord, ...]], ...]:
+    """Read ordered history in one query, retaining empty successful snapshots."""
+    _require_identity(provider, "provider")
+    rows = connection.execute(
+        "SELECT snapshots.*, observations.* FROM snapshots "
+        "LEFT JOIN observations ON observations.snapshot_id = snapshots.id "
+        "WHERE snapshots.provider = ? "
+        "ORDER BY snapshots.completed_at ASC, snapshots.id ASC, "
+        "observations.offering_id COLLATE BINARY ASC",
+        (provider,),
+    )
+    history = []
+    snapshot = None
+    observations = []
+    for row in rows:
+        if snapshot is None or row["id"] != snapshot.id:
+            if snapshot is not None:
+                history.append((snapshot, tuple(observations)))
+            snapshot = _snapshot_from_row(row)
+            observations = []
+        if row["snapshot_id"] is not None:
+            observations.append(_observation_from_row(row))
+    if snapshot is not None:
+        history.append((snapshot, tuple(observations)))
+    return tuple(history)
+
+
 def get_snapshot_observations(
     connection: sqlite3.Connection, snapshot_id: int,
 ) -> tuple[ObservationRecord, ...]:
