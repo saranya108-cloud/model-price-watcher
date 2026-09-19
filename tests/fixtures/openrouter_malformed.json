@@ -1,0 +1,9 @@
+{
+  "data": [
+    {"id": "example/negative", "pricing": {"prompt": "-0.001", "completion": "-Infinity"}},
+    {"id": "example/nonfinite", "pricing": {"prompt": "NaN", "completion": "Infinity"}},
+    {"id": "example/malformed", "pricing": {"prompt": "not-money", "completion": true}},
+    {"id": "example/container", "pricing": {"prompt": {}, "completion": []}},
+    {"id": "example/unsupported", "pricing": {"request": "-1", "image": "NaN"}}
+  ]
+}

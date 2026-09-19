@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": "example/model",
+      "canonical_slug": "example/model-2026",
+      "name": "Example Model",
+      "pricing": {
+        "prompt": "0.0000012345678901234567890123456789",
+        "completion": "0.0000045",
+        "input_cache_read": "0.0000002",
+        "request": "0.01",
+        "image": "0.02",
+        "discount": {"batch_only": true}
+      },
+      "context_length": 128000
+    },
+    {"id": "example/model:free", "pricing": {"prompt": "0", "completion": 0}},
+    {"id": "example/model:extended", "pricing": {"prompt": null}},
+    {"id": "Example/Model", "pricing": {"prompt": 0.000001, "completion": "2e-6"}},
+    {"id": "example/unknown"}
+  ],
+  "catalog_note": "Synthetic offline fixture; not live provider evidence"
+}

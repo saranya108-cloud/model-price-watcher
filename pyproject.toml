@@ -1,0 +1,9 @@
+[project]
+name = "model-price-watcher"
+version = "0.1.0"
+description = "Offline catalog price normalization"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
