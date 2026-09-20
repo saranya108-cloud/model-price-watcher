@@ -448,11 +448,7 @@ def _prepare_write(
     for item in observations:
         if not isinstance(item, CatalogObservation):
             raise TypeError("observations must contain CatalogObservation values")
-        if not isinstance(item.offering_id, str):
-            raise TypeError("offering_id must be a string")
-        if not item.offering_id.strip():
-            raise ValueError("offering_id must be nonblank")
-        _require_sqlite_text(item.offering_id, "offering_id")
+        _require_offering_identity(item.offering_id)
         if item.provider != provider:
             raise ValueError("observation provider must equal snapshot provider")
         if not isinstance(item.source, SourceMetadata):
@@ -476,6 +472,14 @@ def _prepare_write(
     if rows and len(observed_at) != 1:
         raise ValueError("observations must share one UTC observation time")
     return started, completed, source.location, metadata_json, rows
+
+
+def _require_offering_identity(value: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError("offering_id must be a string")
+    if not value.strip():
+        raise ValueError("offering_id must be nonblank")
+    _require_sqlite_text(value, "offering_id")
 
 
 def _require_identity(value: str, name: str) -> None:
@@ -515,8 +519,10 @@ def _snapshot_from_row(row: sqlite3.Row) -> SnapshotRecord:
 def _observation_from_row(row: sqlite3.Row) -> ObservationRecord:
     if not isinstance(row["snapshot_id"], int) or isinstance(row["snapshot_id"], bool):
         raise StorageError("malformed observation snapshot id")
-    if not isinstance(row["offering_id"], str):
-        raise StorageError("malformed offering_id")
+    try:
+        _require_offering_identity(row["offering_id"])
+    except (TypeError, ValueError) as error:
+        raise StorageError("malformed offering_id") from error
     return ObservationRecord(
         row["snapshot_id"],
         row["offering_id"],

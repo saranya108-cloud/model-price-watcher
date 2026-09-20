@@ -292,6 +292,33 @@ class StorageTests(unittest.TestCase):
                 finally:
                     probe.close()
 
+    def test_malformed_persisted_offering_identity_fails_decoding(self):
+        snapshot = self.write()
+        # SQLite trim() does not strip tabs/newlines, and length() stops at NUL.
+        # These corruptions pass the existing schema without disabling checks.
+        for identity in (" \t\n", "valid\x00suffix"):
+            with self.subTest(identity=identity):
+                self.connection.execute(
+                    "UPDATE observations SET offering_id = ? WHERE snapshot_id = ?",
+                    (identity, snapshot.id),
+                )
+                with self.assertRaises(StorageError):
+                    get_snapshot_observations(self.connection, snapshot.id)
+                with self.assertRaises(StorageError):
+                    get_successful_history(self.connection, "openrouter")
+
+    def test_valid_edge_offering_identities_round_trip_exactly(self):
+        identities = ("A", "a", "x", "x ", " x", "\tx\n", "x:free", "模型")
+        snapshot = self.write(tuple(self.observation(identity) for identity in identities))
+        stored = get_snapshot_observations(self.connection, snapshot.id)
+        self.assertEqual(tuple(row.offering_id for row in stored), tuple(sorted(identities)))
+        for identity in identities:
+            with self.subTest(identity=identity):
+                history = get_offering_history(
+                    self.connection, provider="openrouter", offering_id=identity,
+                )
+                self.assertEqual(tuple(row.offering_id for row in history), (identity,))
+
     def test_basic_round_trip(self):
         metadata = {"z": 1, "a": {"keep": True}}
         source = SourceMetadata("locator:not-a-url", metadata)
