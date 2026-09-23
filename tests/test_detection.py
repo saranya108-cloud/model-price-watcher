@@ -48,6 +48,22 @@ UTC = timezone.utc
 DAY = datetime(2026, 9, 1, 12, tzinfo=UTC)
 
 
+class AdvertisedIsolationTests(unittest.TestCase):
+    def test_legacy_history_rejects_reserved_stream_even_empty(self):
+        for provider in ('cheaper_inference', 'cheaper_inference.public.standard', 'cheaper_inference.other'):
+            with self.assertRaises(ValueError):
+                analyze_history([], provider=provider, now=DAY)
+
+    def test_quote_injection_fails_pair_and_history_for_legacy_provider(self):
+        from dataclasses import replace
+        item = ObservationRecord(1, 'A', DAY, Decimal(1), Decimal(2), {}, {}, object())
+        snapshot = SnapshotRecord(1, 'openrouter', DAY, DAY, SOURCE)
+        with self.assertRaises(ValueError):
+            analyze_history([SnapshotFrame(snapshot, (item,))], provider='openrouter', now=DAY)
+        with self.assertRaises(ValueError):
+            compare_observations(item, replace(item, snapshot_id=2))
+
+
 def _context_snapshot(context):
     return (
         context.prec,

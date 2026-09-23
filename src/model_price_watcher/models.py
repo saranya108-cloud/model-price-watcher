@@ -32,6 +32,25 @@ class Diagnostic:
 
 
 @dataclass(frozen=True)
+class AdvertisedQuoteBasis:
+    stream_id: str
+    price_kind: str
+    currency: str
+    unit: str
+    billing_dimension: str
+    tier: str
+    interpretation_policy: str
+    conditions_key: str
+
+
+@dataclass(frozen=True)
+class AdvertisedTokenQuote:
+    basis: AdvertisedQuoteBasis
+    input_usd_per_million: Decimal | None
+    output_usd_per_million: Decimal | None
+
+
+@dataclass(frozen=True)
 class CatalogObservation:
     """One exact catalog ID, including any variant suffix; not an endpoint.
 
@@ -47,6 +66,7 @@ class CatalogObservation:
     output_usd_per_million: Decimal | None
     unsupported_pricing: dict[str, Any]
     raw_offering: dict[str, Any]
+    advertised_quote: AdvertisedTokenQuote | None = None
 
 
 @dataclass(frozen=True)

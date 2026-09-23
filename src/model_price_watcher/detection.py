@@ -195,6 +195,8 @@ def compare_observations(
     """Compare two observations of one exact offering identity."""
     if not isinstance(previous, ObservationRecord) or not isinstance(current, ObservationRecord):
         raise TypeError("observations must be ObservationRecord values")
+    if previous.advertised_quote is not None or current.advertised_quote is not None:
+        raise ValueError('Use advertised comparison APIs for advertised quotes')
     if previous.offering_id != current.offering_id:
         raise ValueError("offering identity mismatch")
     if not isinstance(previous.conditions, dict) or not isinstance(current.conditions, dict):
@@ -231,6 +233,8 @@ def analyze_history(
     """Reduce successful snapshot frames for one exact provider identity."""
     if not isinstance(provider, str):
         raise TypeError("provider must be a string")
+    if provider == 'cheaper_inference' or provider.startswith('cheaper_inference.'):
+        raise ValueError('Use advertised history APIs for this stream')
     now_utc = _require_aware(now, "now")
     if isinstance(frames, (str, bytes)) or not isinstance(frames, Sequence):
         raise TypeError("frames must be a sequence")
@@ -267,6 +271,8 @@ def analyze_history(
         for item in frame.observations:
             if not isinstance(item, ObservationRecord):
                 raise TypeError("observations must contain ObservationRecord values")
+            if item.advertised_quote is not None:
+                raise ValueError('Use advertised history APIs for advertised quotes')
             if item.snapshot_id != snapshot.id:
                 raise ValueError("inconsistent observation/snapshot membership")
             if not isinstance(item.offering_id, str):

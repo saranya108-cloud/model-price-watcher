@@ -95,6 +95,8 @@ def select_offerings(
     Invalid history/time propagates from detection, even for empty selections.
     """
     _require_identity(provider, "provider")
+    if provider == 'cheaper_inference' or provider.startswith('cheaper_inference.'):
+        raise ValueError('Use advertised selection APIs for this stream')
     if isinstance(offering_ids, (str, bytes)) or not isinstance(offering_ids, Sequence):
         raise TypeError("offering_ids must be a sequence")
     selected = set()
@@ -161,6 +163,9 @@ def view_selected_offerings(
     """
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be a sqlite3.Connection")
+    _require_identity(provider, 'provider')
+    if provider == 'cheaper_inference' or provider.startswith('cheaper_inference.'):
+        raise ValueError('Use advertised selection APIs for this stream')
     owned = False
     if not connection.in_transaction:
         connection.execute("BEGIN")

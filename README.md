@@ -14,6 +14,86 @@ It does not evaluate model quality, choose or recommend models, route inference,
 
 ## What it watches
 
+### Implemented library support
+
+The Python library supports OpenRouter catalog history and a separate Cheaper
+Inference **public Standard advertised-price** history. Exact offering IDs remain
+distinct, including case and suffixes. There is no automatic model selection,
+alias matching, routing, or switching. The broader features and commands below
+are plans, not a delivered command-line interface.
+
+Cheaper Inference results describe observed advertised base token prices. They
+do not guarantee a final request charge, availability, savings, or free execution.
+Standard prices are not compared with ZDR prices. A true ZDR flag without an
+explicit route retains the row as evidence-only; a ZDR route rejects the whole
+Standard catalog. Media, unknown conditions, and unsupported rows retain their
+presence without inventing numeric token quotes. Unknown prices are not zero.
+
+Use `providers.cheaper_inference.parse_catalog` for supplied JSON,
+`cheaper_inference_acquisition.scan_cheaper_inference` for one explicitly invoked
+keyless request, and `advertised_queries.view_selected_advertised_offerings` for
+selected exact IDs. The scanner uses only the fixed public catalog URL and an
+injected transport/clock. It has no credentials, retries, pagination, scheduler,
+or inference calls. Failed scans and remote empty catalogs do not replace history;
+an explicitly written successful offline empty catalog is an absence barrier.
+
+```python
+from datetime import datetime, timezone
+from model_price_watcher.storage import open_database
+from model_price_watcher.advertised_queries import view_selected_advertised_offerings
+
+connection = open_database("history.sqlite")
+try:
+    report = view_selected_advertised_offerings(
+        connection, offering_ids=["your-exact-catalog-id"],
+        now=datetime.now(timezone.utc),
+    )
+    for lookup in report.lookups:
+        if lookup.current_observation is not None:
+            quote = lookup.current_observation.advertised_quote
+            if quote is not None:
+                print("Observed advertised input price:", quote.input_usd_per_million)
+finally:
+    connection.close()
+```
+
+`recent_observed_advertised_decrease_ids` reports decreases observed less than
+seven days ago with both components known, unchanged billing basis, and neither
+component increasing. Even a decrease smaller than 5% counts here. Repeated
+unchanged observations do not refresh that window. Absence, unknown components,
+changed basis, unsupported quotes, or time discontinuity clear the event.
+An expired unchanged event remains available for historical explanation.
+
+`zero_advertised_base_token_rate_ids` means “Zero advertised base token rates;
+other charges or conditions may apply.” These quotes never enter legacy deal or
+zero-token lists. An absent selected ID means “Not observed in the latest public
+Standard catalog.” A changed basis means “Price basis changed; no comparable
+decrease calculated.” Public source metadata declares interpretation and does
+not authenticate supplied offline JSON or establish upstream freshness.
+
+### Database compatibility
+
+New empty databases initialize at schema version 2. Version-1 databases require
+the explicit choice `open_database(path, migrate_v1=True)`. This transaction adds
+the nullable advertised-quote column and preserves legacy records; it does not
+reinterpret OpenRouter prices. Version-1 software cannot read the resulting
+version-2 database. Backup creation and downgrade are not provided here.
+
+Only the exact supported schema is accepted. Custom columns, constraints,
+indexes, triggers, views, and SQLite `ANALYZE` statistics are refused, with no
+automatic repair. Invalid stored evidence fails before selected-ID filtering.
+If rollback fails, the original exception retains the rollback failure as
+context; discard and reopen the indeterminate connection rather than reuse it.
+
+Migration tests use disposable fixtures. Existing user data is not migrated as
+part of installation or validation. Run the offline suite from the repository:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
+
+### Planned coverage
+
 Model Price Watcher is intended to track:
 
 - Standard input and output token pricing

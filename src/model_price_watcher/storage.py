@@ -18,7 +18,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from decimal import (
     MAX_EMAX,
@@ -33,10 +33,14 @@ from decimal import (
 from pathlib import Path
 from typing import Any
 
-from model_price_watcher.models import CatalogObservation, SourceMetadata
+from model_price_watcher.models import CatalogObservation, SourceMetadata, AdvertisedQuoteBasis, AdvertisedTokenQuote
+from model_price_watcher.providers.cheaper_inference import (
+    STREAM_ID, is_reserved_stream, validate_public_source, validate_public_observation,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_QUOTE_ALTER = 'ALTER TABLE observations ADD COLUMN advertised_quote_json TEXT'
 MAX_JSON_DEPTH = 64
 
 _SNAPSHOT_COLUMNS = frozenset({
@@ -118,26 +122,30 @@ class ObservationRecord:
     output_per_million: Decimal | None
     conditions: dict[str, Any]
     source_record: dict[str, Any]
+    advertised_quote: AdvertisedTokenQuote | None = None
 
 
-def open_database(path: str | Path) -> sqlite3.Connection:
-    """Open a database, initializing schema version 1 when the file is empty.
+def open_database(path: str | Path, *, migrate_v1: bool = False) -> sqlite3.Connection:
+    """Open the exact v2 schema; v1 requires explicit migration opt-in.
 
-    Connections must come from this function. Callers close them with
-    connection.close(). Close/reopen is required; this is not a power-loss
-    guarantee. Existing non-internal schema objects, including views and
-    triggers, prevent adoption of an unversioned database. Version 1 receives
-    a bounded tables-and-columns check, not a general schema validator.
+    Custom schema objects (including ANALYZE statistics) are refused. Migration
+    is transactional, but not a backup or downgrade facility.
     """
+    if not isinstance(migrate_v1, bool):
+        raise TypeError('migrate_v1 must be bool')
     connection = sqlite3.connect(os.fspath(path), isolation_level=None)
     try:
         connection.row_factory = sqlite3.Row
         _enable_foreign_keys(connection)
         version = _user_version(connection)
         if version == SCHEMA_VERSION:
-            _verify_version_1(connection)
+            _verify_schema(connection, 2)
         elif version == 0:
             _initialize_schema(connection)
+        elif version == 1:
+            if not migrate_v1:
+                raise StorageError('Version 1 requires explicit migration: migrate_v1=True')
+            _migrate_v1(connection)
         else:
             raise StorageError(f"Unsupported schema version {version}")
         return connection
@@ -198,8 +206,8 @@ def write_snapshot(
             connection.execute(
                 "INSERT INTO observations ("
                 "snapshot_id, offering_id, observed_at, input_per_million, "
-                "output_per_million, conditions_json, source_record_json"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "output_per_million, conditions_json, source_record_json, advertised_quote_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (snapshot_id, *row),
             )
         record = SnapshotRecord(
@@ -275,9 +283,11 @@ def get_successful_history(
             snapshot = _snapshot_from_row(row)
             observations = []
         if row["snapshot_id"] is not None:
-            observations.append(_observation_from_row(row))
+            observations.append(_observation_from_row(row, snapshot))
     if snapshot is not None:
         history.append((snapshot, tuple(observations)))
+    for _, items in history:
+        _validate_shared_times(items)
     return tuple(history)
 
 
@@ -288,12 +298,19 @@ def get_snapshot_observations(
     if isinstance(snapshot_id, bool) or not isinstance(snapshot_id, int):
         raise TypeError("snapshot_id must be an int")
     rows = connection.execute(
-        "SELECT * FROM observations "
+        "SELECT snapshots.*, observations.* FROM observations "
+        "JOIN snapshots ON snapshots.id = observations.snapshot_id "
         "WHERE snapshot_id = ? "
         "ORDER BY offering_id COLLATE BINARY ASC",
         (snapshot_id,),
     ).fetchall()
-    return tuple(_observation_from_row(row) for row in rows)
+    # Validate an empty snapshot's source contract as well.
+    parent = connection.execute('SELECT * FROM snapshots WHERE id=?', (snapshot_id,)).fetchone()
+    if parent is not None:
+        _snapshot_from_row(parent)
+    result = tuple(_observation_from_row(row, _snapshot_from_row(row)) for row in rows)
+    _validate_shared_times(result)
+    return result
 
 
 def get_current_observations(
@@ -313,13 +330,13 @@ def get_offering_history(
     _require_identity(provider, "provider")
     _require_identity(offering_id, "offering_id")
     rows = connection.execute(
-        "SELECT observations.* FROM observations "
+        "SELECT snapshots.*, observations.* FROM observations "
         "JOIN snapshots ON snapshots.id = observations.snapshot_id "
         "WHERE snapshots.provider = ? AND observations.offering_id = ? "
         "ORDER BY snapshots.completed_at ASC, snapshots.id ASC",
         (provider, offering_id),
     ).fetchall()
-    return tuple(_observation_from_row(row) for row in rows)
+    return tuple(_observation_from_row(row, _snapshot_from_row(row)) for row in rows)
 
 
 def _close_failed_open(connection: sqlite3.Connection, error: BaseException) -> None:
@@ -346,8 +363,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         acquired = True
         version = _user_version(connection)
         if version == SCHEMA_VERSION:
-            _verify_version_1(connection)
-            connection.rollback()
+            _verify_schema(connection, 2)
+            connection.execute('COMMIT')
             return
         if version != 0:
             raise StorageError(f"Unsupported schema version {version}")
@@ -355,6 +372,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             raise StorageError("Refusing to adopt an unversioned database")
         for statement in _SCHEMA_STATEMENTS:
             connection.execute(statement)
+        connection.execute(_QUOTE_ALTER)
+        _verify_schema(connection, 2)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
         connection.execute("COMMIT")
     except BaseException as error:
@@ -385,22 +404,90 @@ def _user_version(connection: sqlite3.Connection) -> int:
 def _user_schema_objects(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         "SELECT type, name FROM sqlite_master "
-        "WHERE name NOT GLOB 'sqlite_*' "
         "ORDER BY type, name"
     ).fetchall()
 
 
-def _verify_version_1(connection: sqlite3.Connection) -> None:
-    if not _ordinary_table_exists(connection, "snapshots"):
-        raise StorageError("version 1 database is missing the snapshots table")
-    if not _ordinary_table_exists(connection, "observations"):
-        raise StorageError("version 1 database is missing the observations table")
-    snapshot_columns = _table_columns(connection, "snapshots")
-    if not _SNAPSHOT_COLUMNS <= snapshot_columns:
-        raise StorageError("version 1 snapshots table is missing required columns")
-    observation_columns = _table_columns(connection, "observations")
-    if not _OBSERVATION_COLUMNS <= observation_columns:
-        raise StorageError("version 1 observations table is missing required columns")
+def _sql_tokens(sql):
+    if sql is None:
+        return None
+    tokens = []
+    pattern = re.compile(r'''[ \t\r\n\f\v]+|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|>=|<=|<>|!=|[(),.;=<>+*/%-]|'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]''')
+    offset = 0
+    while offset < len(sql):
+        if sql.startswith(('--', '/*'), offset):
+            raise StorageError('SQL comments are outside the supported schema')
+        match = pattern.match(sql, offset)
+        if match is None:
+            raise StorageError('unsupported schema SQL token')
+        token = match.group()
+        offset = match.end()
+        if token[0] in ' \t\r\n\f\v':
+            continue
+        tokens.append(token.lower() if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', token) else token)
+    return tokens
+
+
+def _schema_signature(connection):
+    objects = connection.execute('SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name').fetchall()
+    signature = [(r[0], r[1], r[2], _sql_tokens(r[3])) for r in objects]
+    # Only trusted names enter PRAGMA statements, never names from the input DB.
+    for table in ('snapshots', 'observations'):
+        for pragma in ('table_xinfo', 'foreign_key_list', 'index_list'):
+            signature.append((table, pragma, sorted(tuple(r) for r in connection.execute(f'PRAGMA {pragma}("{table}")'))))
+    for name in ('snapshots_latest_idx', 'observations_offering_history_idx', 'sqlite_autoindex_observations_1'):
+        signature.append((name, tuple(tuple(r) for r in connection.execute(f'PRAGMA index_xinfo("{name}")'))))
+    return signature
+
+
+def _verify_schema(connection, version):
+    _require_foreign_keys(connection)
+    reference = sqlite3.connect(':memory:')
+    try:
+        for sql in _SCHEMA_STATEMENTS:
+            reference.execute(sql)
+        if version == 2:
+            reference.execute(_QUOTE_ALTER)
+        if _schema_signature(connection) != _schema_signature(reference):
+            raise StorageError('database does not match the exact supported schema')
+        if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+            raise StorageError('foreign key integrity failure')
+    finally:
+        reference.close()
+
+
+def _migrate_v1(connection):
+    acquired = False
+    try:
+        connection.execute('BEGIN IMMEDIATE')
+        acquired = True
+        version = _user_version(connection)
+        if version == 2:
+            _verify_schema(connection, 2)
+            connection.execute('COMMIT')
+            return
+        if version != 1:
+            raise StorageError('unexpected schema version during migration')
+        _verify_schema(connection, 1)
+        for row in connection.execute('SELECT * FROM snapshots ORDER BY id'):
+            if is_reserved_stream(row['provider']):
+                raise StorageError('preexisting reserved namespace prevents migration')
+            snapshot = _snapshot_from_row(row)
+            records = tuple(_observation_from_row(r, snapshot) for r in connection.execute(
+                'SELECT * FROM observations WHERE snapshot_id=?', (snapshot.id,)))
+            _validate_shared_times(records)
+        connection.execute(_QUOTE_ALTER)
+        _verify_schema(connection, 2)
+        connection.execute('PRAGMA user_version=2')
+        connection.execute('COMMIT')
+    except BaseException as error:
+        if acquired:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            except BaseException:
+                raise error
+        raise
 
 
 def _ordinary_table_exists(connection: sqlite3.Connection, name: str) -> bool:
@@ -441,6 +528,7 @@ def _prepare_write(
     if completed < started:
         raise ValueError("completed_at must be at or after started_at")
     metadata_json = _encode_json(source.metadata)
+    _validate_provider_source(provider, source)
     if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
         raise TypeError("observations must be a sequence")
     rows = []
@@ -457,6 +545,7 @@ def _prepare_write(
             raise ValueError("observation source must equal snapshot source")
         if _encode_json(item.source.metadata) != metadata_json:
             raise ValueError("observation source must equal snapshot source")
+        _validate_quote_contract(item, source)
         observed = _encode_timestamp(item.observed_at)
         if observed < started or observed > completed:
             raise ValueError("observation time must be within the snapshot interval")
@@ -468,6 +557,7 @@ def _prepare_write(
             _encode_money(item.output_usd_per_million),
             _encode_json(item.unsupported_pricing),
             _encode_json(item.raw_offering),
+            _encode_quote(item.advertised_quote),
         ))
     if rows and len(observed_at) != 1:
         raise ValueError("observations must share one UTC observation time")
@@ -507,23 +597,35 @@ def _snapshot_from_row(row: sqlite3.Row) -> SnapshotRecord:
     completed = _decode_timestamp(row["completed_at"])
     if completed < started:
         raise StorageError("malformed snapshot interval")
+    source = SourceMetadata(row['source_url'], _decode_json(row['source_metadata_json']))
+    try:
+        if not row['provider'].strip():
+            raise ValueError('blank provider')
+        _require_sqlite_text(row['provider'], 'provider')
+        _require_sqlite_text(source.location, 'source')
+        _validate_provider_source(row['provider'], source)
+    except (TypeError, ValueError) as error:
+        raise StorageError('malformed snapshot source contract') from error
     return SnapshotRecord(
         row["id"],
         row["provider"],
         started,
         completed,
-        SourceMetadata(row["source_url"], _decode_json(row["source_metadata_json"])),
+        source,
     )
 
 
-def _observation_from_row(row: sqlite3.Row) -> ObservationRecord:
+def _observation_from_row(row: sqlite3.Row, parent: SnapshotRecord) -> ObservationRecord:
     if not isinstance(row["snapshot_id"], int) or isinstance(row["snapshot_id"], bool):
         raise StorageError("malformed observation snapshot id")
     try:
         _require_offering_identity(row["offering_id"])
     except (TypeError, ValueError) as error:
         raise StorageError("malformed offering_id") from error
-    return ObservationRecord(
+    quote_json = row['advertised_quote_json'] if 'advertised_quote_json' in row.keys() else None
+    if not is_reserved_stream(parent.provider) and quote_json is not None:
+        raise StorageError('legacy provider cannot carry advertised quote evidence')
+    record = ObservationRecord(
         row["snapshot_id"],
         row["offering_id"],
         _decode_timestamp(row["observed_at"]),
@@ -531,7 +633,61 @@ def _observation_from_row(row: sqlite3.Row) -> ObservationRecord:
         _decode_money(row["output_per_million"]),
         _decode_json(row["conditions_json"]),
         _decode_json(row["source_record_json"]),
+        _decode_quote(quote_json),
     )
+    try:
+        if record.snapshot_id != parent.id or not parent.started_at <= record.observed_at <= parent.completed_at:
+            raise ValueError('inconsistent observation membership/time')
+        item = CatalogObservation(parent.provider, record.offering_id, record.observed_at, parent.source,
+                                  record.input_per_million, record.output_per_million,
+                                  record.conditions, record.source_record, record.advertised_quote)
+        _validate_quote_contract(item, parent.source)
+    except (TypeError, ValueError, DecimalException) as error:
+        raise StorageError('malformed observation contract') from error
+    return record
+
+
+def _validate_shared_times(items):
+    if len({r.observed_at for r in items}) > 1:
+        raise StorageError('inconsistent per-snapshot observation times')
+
+
+def _validate_provider_source(provider, source):
+    if is_reserved_stream(provider):
+        if provider != STREAM_ID:
+            raise ValueError('unsupported reserved advertised stream')
+        validate_public_source(source)
+
+
+def _validate_quote_contract(item, source):
+    _validate_provider_source(item.provider, source)
+    if item.provider == STREAM_ID:
+        validate_public_observation(item, source=source)
+    elif item.advertised_quote is not None:
+        raise ValueError('legacy providers cannot carry advertised quotes')
+
+
+def _encode_quote(quote):
+    if quote is None:
+        return None
+    return _encode_json(dict(format_version=1, basis=asdict(quote.basis),
+                            input_usd_per_million=_encode_money(quote.input_usd_per_million),
+                            output_usd_per_million=_encode_money(quote.output_usd_per_million)))
+
+
+def _decode_quote(text):
+    if text is None:
+        return None
+    value = _decode_json(text)
+    if set(value) != {'format_version', 'basis', 'input_usd_per_million', 'output_usd_per_million'}:
+        raise StorageError('invalid quote fields')
+    version = value['format_version']
+    if isinstance(version, bool) or not isinstance(version, (int, Decimal)) or version != 1:
+        raise StorageError('unsupported quote version')
+    basis = value['basis']
+    if not isinstance(basis, dict) or set(basis) != set(AdvertisedQuoteBasis.__dataclass_fields__) or any(not isinstance(v, str) for v in basis.values()):
+        raise StorageError('invalid quote basis')
+    return AdvertisedTokenQuote(AdvertisedQuoteBasis(**basis), _decode_money(value['input_usd_per_million']), _decode_money(value['output_usd_per_million']))
 
 
 def _codec_context() -> Context:

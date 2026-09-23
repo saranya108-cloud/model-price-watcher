@@ -50,6 +50,12 @@ def select(frames, ids, *, now=None, provider="p"):
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_reserved_namespace_is_rejected(self):
+        from datetime import timezone
+        for provider in ('cheaper_inference', 'cheaper_inference.public.standard', 'cheaper_inference.other'):
+            with self.assertRaises(ValueError):
+                select_offerings([], provider=provider, offering_ids=[], now=datetime(2026, 9, 23, tzinfo=timezone.utc))
+
     def test_first_observation_has_price_and_provenance_without_comparison(self):
         first = frame(1, [("a", D(10), None, {"request": "opaque"})])
         report = select((first,), ["a", "missing"])
@@ -288,6 +294,14 @@ class ProjectionTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_unselected_legacy_quote_corruption_is_not_hidden(self):
+        self.write(frame(1, [("a", D(1), D(2), {}), ("b", D(1), D(2), {})]))
+        for raw in ('null', '{}', 'broken'):
+            self.connection.execute("UPDATE observations SET advertised_quote_json=? WHERE offering_id='b'", (raw,))
+            for ids in ([], ['a']):
+                with self.assertRaises(StorageError):
+                    self.view(ids)
+
     def setUp(self):
         self.connection = open_database(":memory:")
         self.addCleanup(self.connection.close)
@@ -409,7 +423,7 @@ class DatabaseTests(unittest.TestCase):
         for caller in (False, True):
             for column, bad, error in (
                 ("input_per_million", "not-money", StorageError),
-                ("observed_at", "2026-09-01T00:00:00.000000Z", ValueError),
+                ("observed_at", "2026-09-01T00:00:00.000000Z", StorageError),
             ):
                 with self.subTest(caller=caller, column=column):
                     original = self.connection.execute(f"SELECT {column} FROM observations").fetchone()[0]

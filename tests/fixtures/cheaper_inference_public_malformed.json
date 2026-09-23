@@ -1,0 +1,1 @@
+{"models":[{"id":"fixture/model-A","model_type":"text","input_per_million":"1.250000","output_per_million":"10.000000","discount_percent":"50.00"},{"id":"fixture/model-B","model_type":"text","input_per_million":"1.00","discount_percent":"0.00"}]}
