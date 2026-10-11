@@ -1,7 +1,7 @@
-"""Pure, versioned public Standard catalog interpretation. No network or storage.
+"""Pure, versioned public catalog interpretation. No network or storage.
 
-Quotes are advertised base token rates, not guarantees of execution charges.
-Unknown schema fields retain presence but disable numeric interpretation.
+Historical v1 quotes are advertised base token rates, not charge guarantees.
+Current v2 retains evidence only: numeric scope semantics are unestablished.
 """
 import json
 import re
@@ -18,13 +18,17 @@ STREAM_ID = "cheaper_inference.public.standard"
 SOURCE_URL = "https://api.cheaperinference.com/public/models"
 CATALOG_SCOPE = "public-advertised-standard"
 PRICE_KIND = "provider_advertised_catalog"
-INTERPRETATION_POLICY = "ci-advertised-base-token-v1"
-SOURCE_METADATA = {
+V1_INTERPRETATION_POLICY = "ci-advertised-base-token-v1"
+V1_SOURCE_METADATA = {
     "catalog_scope": CATALOG_SCOPE,
     "source_contract": "cheaper-inference-public-models-v1",
-    "interpretation_policy": INTERPRETATION_POLICY,
+    "interpretation_policy": V1_INTERPRETATION_POLICY,
     "upstream_freshness": "unknown",
 }
+INTERPRETATION_POLICY = "ci-advertised-evidence-only-v2"
+SOURCE_METADATA = dict(V1_SOURCE_METADATA,
+    source_contract="cheaper-inference-public-models-v2",
+    interpretation_policy=INTERPRETATION_POLICY)
 _REQUIRED = frozenset("id model_type input_per_million output_per_million discount_percent".split())
 _NULLABLE_STRINGS = frozenset('''cache_read_per_million cache_write_per_million
 image_output_per_million media_input_unit_price media_unit_price media_unit
@@ -41,6 +45,7 @@ _ENUMS = {"model_type": ("text", "image", "video"),
           "image_pricing_unit": ("token", "image"),
           "reasoning_capability_mode": ("auto", "manual"),
           "zero_data_retention_route": ("seller", "rail", None)}
+_V2_OPAQUE_STRINGS = frozenset(("image_pricing_unit", "zero_data_retention_route"))
 _KNOWN = _REQUIRED | _NULLABLE_STRINGS | _BOOLS | _INTS | _MAPS | _ENUMS.keys() | {"aliases", "above_threshold"}
 _EXCLUDED = frozenset('''id input_per_million output_per_million discount_percent
 reference_input_per_million reference_output_per_million reference_cache_read_per_million
@@ -54,14 +59,30 @@ _NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?
 
 
 def is_reserved_stream(provider):
-    return isinstance(provider, str) and (provider == "cheaper_inference" or provider.startswith("cheaper_inference."))
+    """Reserve by string content without invoking caller overrides.
+
+    Reserved provider string subclasses are rejected for both v1 and v2;
+    ordinary exact-string v1 providers retain their historical behavior.
+    """
+    if not isinstance(provider, str):
+        return False
+    reserved = (str.__eq__(provider, "cheaper_inference")
+                or str.startswith(provider, "cheaper_inference."))
+    if reserved and type(provider) is not str:
+        raise TypeError("reserved provider must be exact str")
+    return reserved
 
 
 def _context():
     return Context(prec=MAX_PREC, Emax=MAX_EMAX, Emin=MIN_EMIN)
 
 
-def _utc(value):
+def _utc(value, *, exact_types=False):
+    """v2 requires exact datetime/timezone (UTC or fixed offset); v1 normalizes subclasses."""
+    # v2 must reject callbacks before even reading a subclass's tzinfo.
+    # The original observation timestamp also reaches storage serialization.
+    if exact_types and (type(value) is not datetime or type(value.tzinfo) is not timezone):
+        raise TypeError("v2 timestamp must be exact datetime with exact timezone")
     if not isinstance(value, datetime):
         raise TypeError("timestamp must be datetime")
     if value.tzinfo is None or value.utcoffset() is None:
@@ -98,10 +119,12 @@ def _numeric(value):
     return ("-" if sign else "") + coefficient + "e" + str(exponent + len(digits) - 1)
 
 
-def _node(value, depth=0, active=None):
+def _node(value, depth=0, active=None, *, exact_types=False):
     """Validate source depth, then encode; tag expansion has no second depth cap."""
     if active is None:
         active = set()
+    if exact_types and type(value) not in (type(None), bool, str, int, Decimal, dict, list):
+        raise TypeError("v2 evidence must use exact JSON evidence types")
     if value is None:
         return ["n"]
     if isinstance(value, bool):
@@ -118,12 +141,12 @@ def _node(value, depth=0, active=None):
     active.add(id(value))
     try:
         if isinstance(value, list):
-            return ["a", [_node(x, depth + 1, active) for x in value]]
+            return ["a", [_node(x, depth + 1, active, exact_types=exact_types) for x in value]]
         for k in value:
-            if not isinstance(k, str):
+            if not isinstance(k, str) or (exact_types and type(k) is not str):
                 raise TypeError("evidence keys must be strings")
             k.encode("utf-8")
-        return ["o", [[k, _node(value[k], depth + 1, active)] for k in sorted(value)]]
+        return ["o", [[k, _node(value[k], depth + 1, active, exact_types=exact_types)] for k in sorted(value)]]
     finally:
         active.remove(id(value))
 
@@ -136,12 +159,15 @@ def _canonical_conditions_key(row):
 
 
 def validate_public_source(source: SourceMetadata) -> None:
-    if not isinstance(source, SourceMetadata):
+    if type(source) is not SourceMetadata:
         raise TypeError("source must be SourceMetadata")
-    if not isinstance(source.location, str) or not isinstance(source.metadata, dict):
+    # Contract dispatch cannot trust overridden equality on strings/mappings.
+    if type(source.location) is not str or type(source.metadata) is not dict:
         raise TypeError("invalid source fields")
-    if source.location != SOURCE_URL or source.metadata != SOURCE_METADATA:
-        raise ValueError("source must declare the public Standard contract")
+    if any(type(k) is not str or type(v) is not str for k, v in source.metadata.items()):
+        raise TypeError("source metadata must contain exact strings")
+    if source.location != SOURCE_URL or source.metadata not in (V1_SOURCE_METADATA, SOURCE_METADATA):
+        raise ValueError("source must declare an exact public catalog contract")
 
 
 def _integer(value):
@@ -152,11 +178,12 @@ def _integer(value):
         return value.is_finite() and value == value.to_integral_value()
 
 
-def _validate_row(row):
+def _validate_row(row, *, evidence_only=False):
     if not isinstance(row, dict):
         raise TypeError("model must be object")
-    _node(row)
-    if not _REQUIRED <= row.keys():
+    _node(row, exact_types=evidence_only)
+    required = _REQUIRED | {"endpoint", "supported_endpoints"} if evidence_only else _REQUIRED
+    if not required <= row.keys():
         raise ValueError("missing required model field")
     for k in _REQUIRED:
         if not isinstance(row[k], str):
@@ -172,12 +199,23 @@ def _validate_row(row):
         if k in _ENUMS:
             if not isinstance(v, str) and not (v is None and k == 'zero_data_retention_route'):
                 raise TypeError('enum field has wrong type')
-            if v not in _ENUMS[k]:
+            if not (evidence_only and k in _V2_OPAQUE_STRINGS) and v not in _ENUMS[k]:
                 raise ValueError("unsupported enum value")
         if k in _MAPS and (not isinstance(v, dict) or any(not isinstance(x, str) for x in v.values())):
             raise TypeError("price map must contain strings")
     if "aliases" in row and (not isinstance(row["aliases"], list) or any(not isinstance(x, str) for x in row["aliases"])):
         raise TypeError("aliases must be string array")
+    if evidence_only:
+        if not isinstance(row['endpoint'], str):
+            raise TypeError("endpoint must be string")
+        if (not isinstance(row['supported_endpoints'], list)
+                or any(not isinstance(x, str) for x in row['supported_endpoints'])):
+            raise TypeError("supported_endpoints must be string array")
+        if 'default_pricing_scope' in row and not isinstance(row['default_pricing_scope'], dict):
+            raise TypeError("default_pricing_scope must be object")
+        if 'pricing_scopes' in row and (not isinstance(row['pricing_scopes'], list)
+                or any(not isinstance(x, dict) for x in row['pricing_scopes'])):
+            raise TypeError("pricing_scopes must be object array")
     above = row.get("above_threshold")
     if above is not None:
         if not isinstance(above, dict):
@@ -187,9 +225,13 @@ def _validate_row(row):
                 raise TypeError("conditional price must be string")
             if k == "input_token_price_threshold" and not _integer(v):
                 raise TypeError("conditional threshold must be integral")
-            if k == "applies_when" and v != "prompt_tokens_above_threshold_and_supplier_charges_long_context_premium":
-                raise ValueError("invalid threshold condition")
-    if row.get("zero_data_retention_route") is not None:
+            if k == "applies_when":
+                if evidence_only:
+                    if not isinstance(v, str):
+                        raise TypeError("threshold condition must be string")
+                elif v != "prompt_tokens_above_threshold_and_supplier_charges_long_context_premium":
+                    raise ValueError("invalid threshold condition")
+    if not evidence_only and row.get("zero_data_retention_route") is not None:
         raise ValueError("ZDR route cannot enter Standard history")
 
 
@@ -207,10 +249,10 @@ def _money(value, field, identity, diagnostics):
         return None
 
 
-def _derive_public_observation(row, *, observed_at, source):
+def _derive_v1_observation(row, *, observed_at, source):
     _validate_row(row)
     row = deepcopy(row)
-    conditions = {"interpretation_policy": INTERPRETATION_POLICY,
+    conditions = {"interpretation_policy": V1_INTERPRETATION_POLICY,
                   "retained_fields": {k: deepcopy(v) for k, v in row.items() if k not in {"id", "input_per_million", "output_per_million"}}}
     _node(conditions)
     eligible = row["model_type"] == "text" and not row.keys() - _KNOWN
@@ -227,9 +269,26 @@ def _derive_public_observation(row, *, observed_at, source):
         diagnostics.append(Diagnostic("ambiguous_retention_view", "zero_data_retention", "Retention view is ambiguous.", row["id"], True))
     quote = None
     if eligible:
-        basis = AdvertisedQuoteBasis(STREAM_ID, PRICE_KIND, "USD", "per_million_tokens", "text_token", "base", INTERPRETATION_POLICY, _canonical_conditions_key(row))
+        basis = AdvertisedQuoteBasis(STREAM_ID, PRICE_KIND, "USD", "per_million_tokens", "text_token", "base", V1_INTERPRETATION_POLICY, _canonical_conditions_key(row))
         quote = AdvertisedTokenQuote(basis, *(_money(row[k], k, row["id"], diagnostics) for k in ("input_per_million", "output_per_million")))
     return CatalogObservation(STREAM_ID, row["id"], _utc(observed_at), deepcopy(source), None, None, conditions, row, quote), tuple(diagnostics)
+
+
+def _derive_public_observation(row, *, observed_at, source):
+    """Dispatch only by exact metadata, never by row shape or numeric resemblance."""
+    validate_public_source(source)
+    if source.metadata == V1_SOURCE_METADATA:
+        return _derive_v1_observation(row, observed_at=observed_at, source=source)
+    _validate_row(row, evidence_only=True)
+    row = deepcopy(row)
+    reason = "numeric_scope_semantics_unestablished"
+    conditions = {"interpretation_policy": INTERPRETATION_POLICY, "reason": reason,
+                  "retained_fields": {k: deepcopy(v) for k, v in row.items()
+                                      if k not in {"id", "input_per_million", "output_per_million"}}}
+    _node(conditions)
+    observation = CatalogObservation(STREAM_ID, row["id"], _utc(observed_at, exact_types=True),
+        SourceMetadata(source.location, dict(source.metadata)), None, None, conditions, row, None)
+    return observation, (Diagnostic(reason, "$", "Retained evidence has no authoritative numeric quote.", row["id"]),)
 
 
 def validate_public_observation(observation: CatalogObservation, *, source: SourceMetadata) -> None:
@@ -241,12 +300,22 @@ def validate_public_observation(observation: CatalogObservation, *, source: Sour
         raise TypeError('retained evidence must be dictionaries')
     validate_public_source(source)
     validate_public_source(observation.source)
+    evidence_only = source.metadata == SOURCE_METADATA
+    if evidence_only and type(observation) is not CatalogObservation:
+        raise TypeError("v2 observation must be exact CatalogObservation")
     _identity(observation.offering_id)
     if observation.provider != STREAM_ID or observation.source != source:
         raise ValueError("observation must belong to the public Standard source")
     if observation.input_usd_per_million is not None or observation.output_usd_per_million is not None:
         raise ValueError("advertised observations cannot contain legacy prices")
     quote = observation.advertised_quote
+    # Absence is an identity invariant, never an overloaded equality decision.
+    if evidence_only and quote is not None:
+        raise ValueError("v2 observations cannot contain an advertised quote")
+    if evidence_only:
+        if type(observation.provider) is not str or type(observation.offering_id) is not str:
+            raise TypeError("v2 identities must be exact strings")
+        _node(observation.unsupported_pricing, exact_types=True)
     if quote is not None:
         if not isinstance(quote, AdvertisedTokenQuote) or not isinstance(quote.basis, AdvertisedQuoteBasis):
             raise TypeError("invalid quote type")
@@ -264,7 +333,8 @@ def validate_public_observation(observation: CatalogObservation, *, source: Sour
         evidence_equal = _node(observation.unsupported_pricing) == _node(expected.unsupported_pricing)
     except DecimalException as error:
         raise ValueError("invalid numeric evidence") from error
-    if observation.offering_id != expected.offering_id or quote != expected.advertised_quote or not evidence_equal:
+    if (observation.offering_id != expected.offering_id
+            or (not evidence_only and quote != expected.advertised_quote) or not evidence_equal):
         raise ValueError("observation disagrees with retained source evidence")
 
 
@@ -284,9 +354,14 @@ def _reject_constant(value):
 def parse_catalog(raw_catalog: str, *, observed_at: datetime, source: SourceMetadata) -> ParseResult:
     if not isinstance(raw_catalog, str):
         raise TypeError("raw_catalog must be string")
-    observed_at = _utc(observed_at)
+    # Recognize v2 without overloaded metadata equality; preserve v1's original
+    # timestamp/source validation order and permissive timestamp normalization.
+    evidence_only = (type(source) is SourceMetadata and type(source.metadata) is dict
+                     and all(type(k) is str and type(v) is str for k, v in source.metadata.items())
+                     and source.metadata == SOURCE_METADATA)
+    observed_at = _utc(observed_at, exact_types=evidence_only)
     validate_public_source(source)
-    source = deepcopy(source)
+    source = SourceMetadata(source.location, dict(source.metadata)) if evidence_only else deepcopy(source)
     observations, diagnostics = [], []
     try:
         with localcontext(_context()):

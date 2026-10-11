@@ -4,25 +4,64 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from model_price_watcher.models import SourceMetadata
-from model_price_watcher.providers.cheaper_inference import parse_catalog, STREAM_ID, SOURCE_URL, SOURCE_METADATA
+from model_price_watcher.providers.cheaper_inference import parse_catalog, STREAM_ID, SOURCE_URL, V1_SOURCE_METADATA
 from model_price_watcher.storage import SnapshotRecord, ObservationRecord
 from model_price_watcher.detection import SnapshotFrame, ComponentDirection, AggregateDirection, PercentageStatus, Presence
 
 BASE = datetime(2026, 9, 1, tzinfo=timezone.utc)
-SOURCE = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+SOURCE = SourceMetadata(SOURCE_URL, V1_SOURCE_METADATA)
 
-def frame(n, price='1.25', output='10', empty=False, **changes):
+def frame(n, price='1.25', output='10', empty=False, source=SOURCE, **changes):
     at = BASE + timedelta(days=n)
     row = dict(id='A', model_type='text', input_per_million=price, output_per_million=output, discount_percent='0')
+    if source.metadata['source_contract'] == 'cheaper-inference-public-models-v2':
+        row.update(endpoint='/v1/chat/completions', supported_endpoints=[])
     row.update(changes)
-    parsed = parse_catalog(json.dumps({'models': [] if empty else [row]}), observed_at=at, source=SOURCE)
+    parsed = parse_catalog(json.dumps({'models': [] if empty else [row]}), observed_at=at, source=source)
     assert parsed.accepted
     records = tuple(ObservationRecord(n, r.offering_id, r.observed_at, None, None,
                                      r.unsupported_pricing, r.raw_offering, r.advertised_quote) for r in parsed.observations)
-    return SnapshotFrame(SnapshotRecord(n, STREAM_ID, at, at, SOURCE), records)
+    return SnapshotFrame(SnapshotRecord(n, STREAM_ID, at, at, source), records)
 
 
 class AdvertisedDetectionTests(unittest.TestCase):
+    def test_pure_v2_frames_reject_numeric_quote_forgery(self):
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA
+        from model_price_watcher.advertised_detection import compare_advertised_observations
+        v2 = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+        a, b = frame(1), frame(2, source=v2)
+        quote = a.observations[0].advertised_quote
+        for q in (quote, replace(quote, output_usd_per_million=None),
+                  replace(quote, input_usd_per_million=None, output_usd_per_million=None)):
+            forged = replace(b, observations=(replace(b.observations[0], advertised_quote=q),))
+            with self.assertRaises(ValueError):
+                self.analyze([a, forged])
+            with self.assertRaises(ValueError):
+                compare_advertised_observations(a, forged, offering_id='A')
+
+    def test_v1_v2_policy_barrier_clears_event_in_both_directions(self):
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA
+        from model_price_watcher.advertised_detection import (compare_advertised_observations,
+            AdvertisedComparability as C, AdvertisedResetReason as R)
+        v2 = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+        a, b = frame(1), frame(2, '1')
+        self.assertIsNotNone(self.analyze([a, b]).offerings[0].decrease_event)
+        c, d, e = frame(3, '0', '0', source=v2), frame(4, '0', source=v2), frame(5, '0.5')
+        for left, right in ((b, c), (c, d), (d, e)):
+            with self.subTest(policies=(left.snapshot.source, right.snapshot.source)):
+                comparison = compare_advertised_observations(left, right, offering_id='A')
+                self.assertEqual(comparison.reason, C.QUOTE_UNSUPPORTED)
+                self.assertEqual(comparison.aggregate, AggregateDirection.NONCOMPARABLE)
+                self.assertEqual((comparison.input, comparison.output), (None, None))
+        for frames in ([a, b, c], [a, b, c, d], [a, b, c, d, e]):
+            item, = self.analyze(frames).offerings
+            self.assertEqual(item.reset_reason, R.QUOTE_UNSUPPORTED)
+            self.assertIsNone(item.decrease_event)
+            self.assertEqual(item.current_quote, frames[-1].observations[0].advertised_quote)
+        # Returning to historical v1 establishes a fresh baseline before a new event.
+        new_event = self.analyze([a, b, c, d, e, frame(6, '0.25')]).offerings[0].decrease_event
+        self.assertEqual((new_event.previous_snapshot_id, new_event.current_snapshot_id), (5, 6))
+
     def analyze(self, frames):
         from model_price_watcher.advertised_detection import analyze_advertised_history
         return analyze_advertised_history(frames, now=BASE + timedelta(days=20))

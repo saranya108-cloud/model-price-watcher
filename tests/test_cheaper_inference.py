@@ -17,6 +17,40 @@ def row(**changes):
                 output_per_million="10", discount_percent="0"), **changes)
 
 class ParserContractTests(unittest.TestCase):
+    def test_v1_complete_rejection_results_golden(self):
+        """Independent HEAD baseline: atomic rejection, diagnostics and raw/source."""
+        import hashlib
+        from dataclasses import asdict
+        changes = ({'zero_data_retention_route': 'seller'}, {'zero_data_retention_route': 'rail'},
+                   {'zero_data_retention_route': 'discounted'}, {'zero_data_retention_route': 'future-route'},
+                   {'image_pricing_unit': 'second'}, {'image_pricing_unit': 'future-unit'},
+                   {'above_threshold': {'applies_when': 'prompt_tokens_above_threshold'}},
+                   {'above_threshold': {'applies_when': 'unknown-condition'}},
+                   {'model_type': 'future-model'}, {'input_per_million': 1}, {'id': '\x00'})
+        results = [self.parse([row(id='good'), row(**change)]) for change in changes]
+        self.assertTrue(all(not r.accepted and not r.observations for r in results))
+        encoded = json.dumps([asdict(r) for r in results], default=str, sort_keys=True,
+                             ensure_ascii=True, separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(),
+                         '4ab3c9d7ce408d34a5f56d17b3d53f514fb27e6c1217ac4088d6ff6af1ee80f6')
+
+    def test_v1_complete_result_golden(self):
+        """Pinned before adaptation: includes raw/source/conditions/quotes/diagnostics."""
+        import hashlib
+        from dataclasses import asdict
+        base = dict(model_type='text', input_per_million='1.2500',
+                    output_per_million='10', discount_percent='0')
+        changes = ({}, {'zero_data_retention': True}, {'new_field': {'x': [1, None]}},
+                   {'model_type': 'image'},
+                   {'input_token_price_threshold': 100, 'above_threshold': {'input_per_million': '4'}},
+                   {'media_prices': {'image': '1'}}, {'output_per_million': 'bad'},
+                   {'input_per_million': '?', 'output_per_million': '?'})
+        result = self.parse([dict(base, id='golden-'+str(i), **c) for i, c in enumerate(changes)])
+        encoded = json.dumps(asdict(result), default=str, sort_keys=True,
+                             ensure_ascii=True, separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(),
+                         'e20878984b8c2ebdc100776cf9902c6752d2ca0ac7a4c78a771bf5547cffdbec')
+
     def test_exact_advertised_quote_without_legacy_prices(self):
         from model_price_watcher.providers.cheaper_inference import parse_catalog
         result = parse_catalog(json.dumps({"models": [row()]}), observed_at=AT, source=SOURCE)
@@ -209,3 +243,301 @@ class ParserContractTests(unittest.TestCase):
             self.assertIn('1.'+'1'*4300+'e4300', quote.basis.conditions_key)
             self.assertEqual((ctx.prec, ctx.Emax, ctx.Emin, ctx.flags, ctx.traps),
                              (before.prec, before.Emax, before.Emin, before.flags, before.traps))
+
+
+V2_SOURCE = SourceMetadata(SOURCE.location, dict(SOURCE.metadata,
+    source_contract='cheaper-inference-public-models-v2',
+    interpretation_policy='ci-advertised-evidence-only-v2'))
+
+
+class EvidenceOnlyV2Tests(unittest.TestCase):
+    def test_v2_custom_timezone_rejected_without_executing_mutation(self):
+        from dataclasses import replace
+        from datetime import timedelta, tzinfo
+        from model_price_watcher.providers.cheaper_inference import parse_catalog, validate_public_observation
+        quote = self.parse([row()], SOURCE).observations[0].advertised_quote
+        calls = []
+        class MutatingZone(tzinfo):
+            def utcoffset(self, value):
+                calls.append('utcoffset')
+                object.__setattr__(item, 'advertised_quote', quote)
+                return timedelta(0)
+            def dst(self, value):
+                calls.append('dst')
+                object.__setattr__(item, 'advertised_quote', quote)
+                return timedelta(0)
+            def tzname(self, value):
+                calls.append('tzname')
+                object.__setattr__(item, 'advertised_quote', quote)
+                return 'hostile'
+        stamp = datetime(2026, 9, 23, tzinfo=MutatingZone())
+        item = replace(self.parse([row()]).observations[0], observed_at=stamp)
+        with self.assertRaises(TypeError):
+            validate_public_observation(item, source=V2_SOURCE)
+        with self.assertRaises(TypeError):
+            parse_catalog('{"models":[]}', observed_at=stamp, source=V2_SOURCE)
+        self.assertEqual(calls, [])
+        self.assertIsNone(item.advertised_quote)
+
+    def test_v2_datetime_subclass_rejected_before_attribute_or_method_callbacks(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import parse_catalog, validate_public_observation
+        quote = self.parse([row()], SOURCE).observations[0].advertised_quote
+        calls = []
+        class MutatingDatetime(datetime):
+            def __getattribute__(self, name):
+                if name in ('tzinfo', 'utcoffset', 'astimezone'):
+                    calls.append(name)
+                    object.__setattr__(item, 'advertised_quote', quote)
+                return super().__getattribute__(name)
+        stamp = MutatingDatetime(2026, 9, 23, tzinfo=timezone.utc)
+        item = replace(self.parse([row()]).observations[0], observed_at=stamp)
+        with self.assertRaises(TypeError):
+            validate_public_observation(item, source=V2_SOURCE)
+        with self.assertRaises(TypeError):
+            parse_catalog('{"models":[]}', observed_at=stamp, source=V2_SOURCE)
+        self.assertEqual(calls, [])
+        self.assertIsNone(item.advertised_quote)
+
+    def test_v2_parser_produces_exact_builtin_utc_timestamps(self):
+        from datetime import timedelta
+        from model_price_watcher.providers.cheaper_inference import parse_catalog, validate_public_observation
+        raw = json.dumps({'models': [row(endpoint='/v1/responses', supported_endpoints=[])]})
+        for stamp in (AT, datetime(2026, 9, 23, 5, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))):
+            with self.subTest(stamp=stamp):
+                result = parse_catalog(raw, observed_at=stamp, source=V2_SOURCE)
+                self.assertTrue(result.accepted)
+                for value in (result.observed_at, result.observations[0].observed_at):
+                    self.assertIs(type(value), datetime)
+                    self.assertIs(type(value.tzinfo), timezone)
+                    self.assertIs(value.tzinfo, timezone.utc)
+                    self.assertEqual(value, AT)
+                item, = result.observations
+                validate_public_observation(item, source=V2_SOURCE)
+                self.assertIsNone(item.advertised_quote)
+        with self.assertRaises((TypeError, ValueError)):
+            parse_catalog(raw, observed_at=datetime(2026, 9, 23), source=V2_SOURCE)
+
+    def parse(self, rows, source=V2_SOURCE):
+        from model_price_watcher.providers.cheaper_inference import parse_catalog
+        # v2 routing metadata is structural, never a routing/price selection input.
+        if source == V2_SOURCE:
+            rows = [dict({'endpoint': '/v1/chat/completions', 'supported_endpoints': []}, **r) for r in rows]
+        # Exact accepted v2 metadata must be admitted before row interpretation.
+        if source == V2_SOURCE:
+            try:
+                return parse_catalog(json.dumps({'models': rows}), observed_at=AT, source=source)
+            except ValueError as error:
+                self.fail('exact v2 source rejected: '+str(error))
+        return parse_catalog(json.dumps({'models': rows}), observed_at=AT, source=source)
+
+    def test_exact_contract_dispatch_and_no_shape_inference(self):
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA, V1_SOURCE_METADATA
+        self.assertEqual(SOURCE_METADATA, V2_SOURCE.metadata)
+        self.assertEqual(V1_SOURCE_METADATA, SOURCE.metadata)
+        self.assertIsNotNone(self.parse([row()], SOURCE).observations[0].advertised_quote)
+        self.assertIsNone(self.parse([row()]).observations[0].advertised_quote)
+        # A v2-looking row never causes fallback from declared v1.
+        self.assertFalse(self.parse([row(zero_data_retention_route='none')], SOURCE).accepted)
+        for contract, policy in (('v1', 'evidence-only-v2'), ('v2', 'base-token-v1'),
+                                 ('v3', 'evidence-only-v2')):
+            mixed = SourceMetadata(SOURCE.location, dict(SOURCE.metadata,
+                source_contract='cheaper-inference-public-models-'+contract,
+                interpretation_policy='ci-advertised-'+policy))
+            with self.subTest(contract=contract, policy=policy), self.assertRaises(ValueError):
+                self.parse([row()], mixed)
+        for invalid in (SourceMetadata(SOURCE.location+'?zdr=true', V2_SOURCE.metadata),
+                        SourceMetadata(SOURCE.location, dict(V2_SOURCE.metadata, extra=True))):
+            with self.assertRaises((TypeError, ValueError)):
+                self.parse([], invalid)
+
+    def test_every_v2_row_has_no_numeric_interpretation(self):
+        from model_price_watcher.providers.cheaper_inference import validate_public_observation
+        cases = ({}, {'input_per_million': 'bad'},
+                 {'input_per_million': '?', 'output_per_million': '?'},
+                 {'zero_data_retention': True, 'zero_data_retention_route': 'rail_only'},
+                 {'zero_data_retention_route': 'discounted'}, {'zero_data_retention_route': 'none'},
+                 {'zero_data_retention_route': None}, {'image_pricing_unit': 'second'},
+                 {'above_threshold': {'applies_when': 'prompt_tokens_above_threshold'}},
+                 {'new_field': {'unknown_semantics': [1, None]}},
+                 {'default_pricing_scope': {'serviceTier': 'priority', 'zdr': True},
+                  'pricing_scopes': [{'scope': {'serviceTier': 'flex'},
+                                      'rates': {'input_tokens': '0'}, 'expiresAt': 'unknown'}]})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = self.parse([row(**changes)])
+                self.assertTrue(result.accepted)
+                item, = result.observations
+                self.assertEqual((item.advertised_quote, item.input_usd_per_million,
+                                  item.output_usd_per_million), (None, None, None))
+                self.assertEqual(item.unsupported_pricing, {
+                    'interpretation_policy': 'ci-advertised-evidence-only-v2',
+                    'reason': 'numeric_scope_semantics_unestablished',
+                    'retained_fields': {k: v for k, v in dict(row(endpoint='/v1/chat/completions', supported_endpoints=[]), **changes).items()
+                                        if k not in {'id', 'input_per_million', 'output_per_million'}}})
+                self.assertEqual([d.code for d in result.diagnostics],
+                                 ['numeric_scope_semantics_unestablished'])
+                self.assertEqual(item.raw_offering, dict(row(endpoint='/v1/chat/completions', supported_endpoints=[]), **changes))
+                validate_public_observation(item, source=V2_SOURCE)
+
+    def test_required_routing_types_and_atomic_structure_rejection(self):
+        from model_price_watcher.providers.cheaper_inference import parse_catalog
+        for changes in ({'endpoint': 'future endpoint', 'supported_endpoints': []},
+                        {'endpoint': '', 'supported_endpoints': ['unfamiliar', '/v1/messages']}):
+            self.assertTrue(self.parse([row(**changes)]).accepted)
+        for missing in ('endpoint', 'supported_endpoints'):
+            model = row(endpoint='/v1/responses', supported_endpoints=[])
+            del model[missing]
+            self.assertFalse(parse_catalog(json.dumps({'models': [model]}), observed_at=AT, source=V2_SOURCE).accepted)
+        for changes in ({'endpoint': None}, {'endpoint': 1}, {'supported_endpoints': 'x'},
+                        {'supported_endpoints': [1]}, {'supported_endpoints': None},
+                        {'default_pricing_scope': []}, {'pricing_scopes': {}},
+                        {'pricing_scopes': [1]}, {'zero_data_retention_route': 1},
+                        {'zero_data_retention_route': []}, {'image_pricing_unit': None},
+                        {'image_pricing_unit': {}}, {'media_unit': 1},
+                        {'above_threshold': {'applies_when': 1}},
+                        {'above_threshold': {'applies_when': None}}, {'input_per_million': 1},
+                        {'zero_data_retention': None}, {'model_type': 'other'}):
+            with self.subTest(changes=changes):
+                model = row(endpoint='/v1/responses', supported_endpoints=[])
+                model.update(changes)
+                result = self.parse([row(id='good'), model])
+                self.assertFalse(result.accepted)
+                self.assertEqual(result.observations, ())
+
+    def test_unfamiliar_string_meanings_remain_exact_evidence(self):
+        cases = ([{'zero_data_retention_route': value} for value in
+                  ('discounted', 'rail_only', 'none', 'seller', 'rail', 'future-route')]
+                 + [{'above_threshold': {'applies_when': value}} for value in
+                    ('prompt_tokens_above_threshold', 'future condition with different meaning')]
+                 + [{'image_pricing_unit': value} for value in ('second', 'future-unit')]
+                 + [{'media_unit': 'future-media-unit'}])
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = self.parse([row(**changes)])
+                self.assertTrue(result.accepted)
+                item, = result.observations
+                self.assertIsNone(item.advertised_quote)
+                for key, value in changes.items():
+                    self.assertEqual(item.raw_offering[key], value)
+                    self.assertEqual(item.unsupported_pricing['retained_fields'][key], value)
+
+    def test_scope_contents_remain_opaque_and_ordered(self):
+        scopes = [{'future': {'unit': 'credits', 'rates': [None, True, '1']}},
+                  {'scope': None, 'missing_authority': ['unknown', {'x': 3}]}]
+        cases = ({}, {'default_pricing_scope': {}}, {'pricing_scopes': []},
+                 {'default_pricing_scope': {'unexpected': [False, None, {'nested': 'opaque'}]}},
+                 {'pricing_scopes': scopes}, {'pricing_scopes': list(reversed(scopes))},
+                 {'pricing_scopes': [{}], 'new_row_field': {'unfamiliar': [1, None]}})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = self.parse([row(**changes)])
+                self.assertTrue(result.accepted)
+                item, = result.observations
+                self.assertIsNone(item.advertised_quote)
+                for key, value in changes.items():
+                    self.assertEqual(item.raw_offering[key], value)
+
+    def test_v2_equality_overrides_cannot_forge_source_or_evidence(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import validate_public_source, validate_public_observation
+        class EqualString(str):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        class EqualDict(dict):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        class EqualSource(SourceMetadata):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        invalid_sources = (SourceMetadata(EqualString('https://wrong.invalid'), dict(V2_SOURCE.metadata)),
+                           SourceMetadata(SOURCE.location, EqualDict(V2_SOURCE.metadata)),
+                           SourceMetadata(SOURCE.location, dict(V2_SOURCE.metadata,
+                                          source_contract=EqualString('unknown-contract'))),
+                           EqualSource(SOURCE.location, dict(V2_SOURCE.metadata)))
+        for invalid in invalid_sources:
+            with self.subTest(source=invalid), self.assertRaises((TypeError, ValueError)):
+                validate_public_source(invalid)
+        item = self.parse([row()]).observations[0]
+        for change in ({'unsupported_pricing': dict(item.unsupported_pricing, reason=EqualString('forged'))},
+                       {'unsupported_pricing': EqualDict(item.unsupported_pricing)},
+                       {'raw_offering': dict(item.raw_offering, zero_data_retention_route=EqualString('seller'))}):
+            with self.subTest(change=change), self.assertRaises((TypeError, ValueError)):
+                validate_public_observation(replace(item, **change), source=V2_SOURCE)
+
+    def test_v2_keeps_json_identity_depth_and_documented_type_guards(self):
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog, _NULLABLE_STRINGS, _BOOLS, _INTS, _MAPS)
+        for field in _NULLABLE_STRINGS | _BOOLS | _INTS | _MAPS:
+            with self.subTest(field=field):
+                self.assertFalse(self.parse([row(**{field: []})]).accepted)
+        for changes in ({'id': ''}, {'id': ' '}, {'id': '\x00'}, {'id': '\ud800'},
+                        {'unknown': '\ud800'}, {'above_threshold': []},
+                        {'aliases': [1]}, {'reasoning_capability_mode': 'future'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.parse([row(**changes)]).accepted)
+        for raw in ('not json', '{"models":[],"models":[]}', '{"models":[],"extra":null}',
+                    '{"models":[null]}', '{"models":[[]]}', '{"models":[NaN]}',
+                    '{"models":[Infinity]}', '{"models":[{"x":1,"x":2}]}'):
+            with self.subTest(raw=raw):
+                self.assertFalse(parse_catalog(raw, observed_at=AT, source=V2_SOURCE).accepted)
+        self.assertFalse(self.parse([row(), row()]).accepted)
+        nested = {}
+        for _ in range(64):
+            nested = {'x': nested}
+        self.assertFalse(self.parse([row(unknown=nested)]).accepted)
+
+    def test_retained_attempt_01_exact_fixture_all_97_rows(self):
+        import hashlib
+        from pathlib import Path
+        from decimal import Decimal
+        from model_price_watcher.providers.cheaper_inference import parse_catalog
+        data = (Path(__file__).parent/'fixtures/cheaper_inference_public_catalog_g1b_live_01.json').read_bytes()
+        self.assertEqual(len(data), 732879)
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         'eacd19c8b34bb51928180ceb7c2831315f70de9515e4d6ca9900c71b9e77e0f1')
+        result = parse_catalog(data.decode('utf-8'), observed_at=AT, source=V2_SOURCE)
+        self.assertTrue(result.accepted)
+        raw_rows = json.loads(data, parse_int=Decimal, parse_float=Decimal)['models']
+        self.assertEqual(len(result.observations), 97)
+        self.assertEqual(len(result.diagnostics), 97)
+        for item, raw in zip(result.observations, raw_rows):
+            self.assertEqual(item.raw_offering, raw)
+            self.assertEqual(item.offering_id, raw['id'])
+            self.assertEqual(item.observed_at, AT)
+            self.assertEqual(item.source, V2_SOURCE)
+            self.assertIsNone(item.advertised_quote)
+        self.assertFalse(parse_catalog(data.decode('utf-8'), observed_at=AT, source=SOURCE).accepted)
+
+    def test_v2_forged_quotes_legacy_prices_and_reason_rejected(self):
+        from dataclasses import replace
+        from model_price_watcher.models import AdvertisedTokenQuote
+        from model_price_watcher.providers.cheaper_inference import validate_public_observation
+        class NoneLikeQuote:
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+            def __bool__(self): return False
+        class EqualQuote(AdvertisedTokenQuote):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        class EqualString(str):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        item = self.parse([row()]).observations[0]
+        quote = self.parse([row()], SOURCE).observations[0].advertised_quote
+        for q in (quote, replace(quote, output_usd_per_million=None),
+                  replace(quote, input_usd_per_million=None, output_usd_per_million=None),
+                  replace(quote, input_usd_per_million=Decimal(0), output_usd_per_million=Decimal(0)),
+                  replace(quote, basis=replace(quote.basis, interpretation_policy=V2_SOURCE.metadata['interpretation_policy'])),
+                  replace(quote, basis=replace(quote.basis, unit=EqualString('forged-unit'))),
+                  EqualQuote(quote.basis, Decimal('1.25'), Decimal('10')),
+                  EqualQuote(quote.basis, Decimal('1.25'), None), EqualQuote(quote.basis, None, None),
+                  NoneLikeQuote(), False, object()):
+            with self.subTest(quote=q), self.assertRaises(ValueError):
+                validate_public_observation(replace(item, advertised_quote=q), source=V2_SOURCE)
+        for changes in ({'input_usd_per_million': Decimal(1)},
+                        {'output_usd_per_million': Decimal(1)},
+                        {'unsupported_pricing': dict(item.unsupported_pricing, reason='other')},
+                        {'source': SOURCE}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_public_observation(replace(item, **changes), source=V2_SOURCE)

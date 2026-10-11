@@ -10,7 +10,7 @@ from model_price_watcher.storage import open_database, get_successful_history, w
 from model_price_watcher.providers.cheaper_inference import STREAM_ID
 
 BASE = datetime(2026, 9, 1, tzinfo=timezone.utc)
-BODY = b'{"models":[{"id":"A","model_type":"text","input_per_million":"1.25","output_per_million":"10","discount_percent":"0"}]}'
+BODY = b'{"models":[{"id":"A","model_type":"text","input_per_million":"1.25","output_per_million":"10","discount_percent":"0","endpoint":"/v1/chat/completions","supported_endpoints":[]}]}'
 HEADERS = (('Content-Type', 'application/json'),)
 
 
@@ -76,18 +76,25 @@ class AcquisitionContractTests(unittest.TestCase):
             transport.get.assert_not_called()
             c.close()
 
-    def test_ambiguous_zdr_and_conflicting_route(self):
+    def test_v2_route_strings_and_routing_metadata_are_evidence_only(self):
         rows = json.loads(BODY)['models']
         rows[0]['zero_data_retention'] = True
         rows.append(dict(rows[0], id='B', zero_data_retention=False))
         self.scan(HttpResponse(200, json.dumps({'models': rows}).encode(), HEADERS))
         _, stored = get_successful_history(self.connection, STREAM_ID)[0]
         self.assertIsNone(stored[0].advertised_quote)
-        self.assertIsNotNone(stored[1].advertised_quote)
-        rows[0]['zero_data_retention_route'] = 'rail'
-        with self.assertRaises(AcquisitionError):
-            self.scan(HttpResponse(200, json.dumps({'models': rows}).encode(), HEADERS), day=1)
-        self.assertEqual(len(get_successful_history(self.connection, STREAM_ID)), 1)
+        self.assertIsNone(stored[1].advertised_quote)
+        self.assertTrue(all(r.conditions['reason'] == 'numeric_scope_semantics_unestablished' for r in stored))
+        for day, route in enumerate(('seller', 'rail', 'future-route'), 1):
+            rows[0].update(zero_data_retention_route=route, endpoint='https://unused.invalid/future',
+                           supported_endpoints=['unknown-route'], image_pricing_unit='future-unit',
+                           above_threshold={'applies_when': 'unknown-condition'})
+            self.scan(HttpResponse(200, json.dumps({'models': rows}).encode(), HEADERS), day=day)
+            self.assertEqual(self.transport.get.call_args.args, ('https://api.cheaperinference.com/public/models',))
+            _, stored = get_successful_history(self.connection, STREAM_ID)[-1]
+            self.assertTrue(all(r.advertised_quote is None for r in stored))
+            self.assertEqual(stored[0].source_record, rows[0])
+        self.assertEqual(len(get_successful_history(self.connection, STREAM_ID)), 4)
 
     def test_network_clock_and_storage_failures(self):
         from model_price_watcher.cheaper_inference_acquisition import scan_cheaper_inference
@@ -120,7 +127,8 @@ class AcquisitionContractTests(unittest.TestCase):
         self.scan(response('1.25'))
         self.scan(response('1'), day=1)
         before = view()
-        self.assertEqual(before.recent_observed_advertised_decrease_ids, ('A', 'B'))
+        self.assertEqual(before.recent_observed_advertised_decrease_ids, ())
+        self.assertTrue(all(x.current_observation.advertised_quote is None for x in before.lookups))
         with self.assertRaises(AcquisitionError):
             self.scan(HttpResponse(200, b'{"models":[]}', HEADERS), day=2)
         self.assertEqual(view(), before)
@@ -130,6 +138,24 @@ class AcquisitionContractTests(unittest.TestCase):
         restored = view().lookups[0]
         self.assertEqual(restored.detection.reset_reason, AdvertisedResetReason.RETURN_AFTER_ABSENCE)
         self.assertIsNone(restored.detection.decrease_event)
+
+    def test_retained_attempt_01_fake_transport_roundtrip(self):
+        from pathlib import Path
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA
+        data = (Path(__file__).parent/'fixtures/cheaper_inference_public_catalog_g1b_live_01.json').read_bytes()
+        result = self.scan(HttpResponse(200, data, HEADERS))
+        self.transport.get.assert_called_once()
+        self.assertEqual(result.observation_count, 97)
+        (snapshot, stored), = get_successful_history(self.connection, STREAM_ID)
+        self.assertEqual(snapshot.source.metadata, SOURCE_METADATA)
+        self.assertEqual(len(stored), 97)
+        self.assertTrue(all(r.advertised_quote is None and r.input_per_million is None
+                            and r.output_per_million is None for r in stored))
+        self.assertEqual([r.source_record['id'] for r in stored], sorted(r['id'] for r in json.loads(data)['models']))
+        raw_by_id = {r['id']: r for r in json.loads(data)['models']}
+        for r in stored:
+            self.assertEqual(r.source_record, raw_by_id[r.offering_id])
+
 
     def test_invalid_limits_and_clock_types_never_request(self):
         from model_price_watcher.cheaper_inference_acquisition import scan_cheaper_inference

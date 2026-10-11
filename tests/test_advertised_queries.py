@@ -5,27 +5,71 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from model_price_watcher.models import SourceMetadata
-from model_price_watcher.providers.cheaper_inference import parse_catalog, STREAM_ID, SOURCE_URL, SOURCE_METADATA
+from model_price_watcher.providers.cheaper_inference import parse_catalog, STREAM_ID, SOURCE_URL, V1_SOURCE_METADATA
 from model_price_watcher.storage import open_database, write_snapshot, get_successful_history, StorageError
 from model_price_watcher.detection import SnapshotFrame
 from model_price_watcher.queries import LookupStatus
 
 BASE = datetime(2026, 9, 1, tzinfo=timezone.utc)
-SOURCE = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+SOURCE = SourceMetadata(SOURCE_URL, V1_SOURCE_METADATA)
 
 
 class QueryTests(unittest.TestCase):
+    def test_v2_forgery_rejected_even_when_id_not_selected(self):
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA
+        from model_price_watcher.advertised_queries import select_advertised_offerings
+        v2 = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+        self.write(1)
+        encoded = self.connection.execute('SELECT advertised_quote_json FROM observations').fetchone()[0]
+        self.write(2, source=v2)
+        frames = tuple(SnapshotFrame(s, r) for s, r in get_successful_history(self.connection, STREAM_ID))
+        forged = replace(frames[-1], observations=(replace(frames[-1].observations[0],
+                         advertised_quote=frames[0].observations[0].advertised_quote),))
+        with self.assertRaises(ValueError):
+            select_advertised_offerings((frames[0], forged), offering_ids=('unselected',), now=BASE+timedelta(days=3))
+        self.connection.execute('UPDATE observations SET advertised_quote_json=? WHERE snapshot_id=?',
+                                (encoded, frames[-1].snapshot.id))
+        with self.assertRaises(StorageError):
+            self.view(ids=('unselected',))
+
     def setUp(self):
         self.connection = open_database(':memory:')
         self.addCleanup(self.connection.close)
 
-    def write(self, day, price='1.25', rows=None):
+    def write(self, day, price='1.25', rows=None, source=SOURCE):
         at = BASE + timedelta(days=day)
         if rows is None:
             rows = [dict(id='A', model_type='text', input_per_million=price, output_per_million='0', discount_percent='0')]
-        parsed = parse_catalog(json.dumps({'models': rows}), observed_at=at, source=SOURCE)
+            if source.metadata['source_contract'] == 'cheaper-inference-public-models-v2':
+                rows[0].update(endpoint='/v1/chat/completions', supported_endpoints=[])
+        parsed = parse_catalog(json.dumps({'models': rows}), observed_at=at, source=source)
         self.assertTrue(parsed.accepted)
-        write_snapshot(self.connection, provider=STREAM_ID, started_at=at, completed_at=at, source=SOURCE, observations=parsed.observations)
+        write_snapshot(self.connection, provider=STREAM_ID, started_at=at, completed_at=at, source=source, observations=parsed.observations)
+
+    def test_current_v2_never_projects_stale_v1_numeric_price(self):
+        from model_price_watcher.providers.cheaper_inference import SOURCE_METADATA
+        from model_price_watcher.advertised_queries import select_advertised_offerings
+        from model_price_watcher.advertised_detection import AdvertisedResetReason as R
+        v2 = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
+        self.write(1)
+        self.write(2, '1')
+        self.assertEqual(self.view().recent_observed_advertised_decrease_ids, ('A',))
+        self.write(3, '0', source=v2)
+        report = self.view()
+        frames = tuple(SnapshotFrame(s, r) for s, r in get_successful_history(self.connection, STREAM_ID))
+        self.assertEqual(report, select_advertised_offerings(frames, offering_ids=('A', 'never'), now=BASE+timedelta(days=3)))
+        lookup = report.lookups[0]
+        self.assertEqual(lookup.status, LookupStatus.CURRENT)
+        self.assertEqual(lookup.current_observation.snapshot_id, report.latest_snapshot.id)
+        self.assertEqual(lookup.current_observation.conditions['interpretation_policy'], v2.metadata['interpretation_policy'])
+        self.assertIsNone(lookup.current_observation.advertised_quote)
+        self.assertIsNone(lookup.detection.current_quote)
+        self.assertEqual(lookup.detection.reset_reason, R.QUOTE_UNSUPPORTED)
+        self.assertIsNone(lookup.detection.decrease_event)
+        self.assertEqual((report.recent_observed_advertised_decrease_ids,
+                          report.zero_advertised_base_token_rate_ids), ((), ()))
+        self.assertIsNotNone(frames[0].observations[0].advertised_quote)
+
 
     def view(self, now=BASE+timedelta(days=3), ids=('A', 'never')):
         from model_price_watcher.advertised_queries import view_selected_advertised_offerings

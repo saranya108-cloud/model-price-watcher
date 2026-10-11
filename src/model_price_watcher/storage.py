@@ -170,7 +170,8 @@ def write_snapshot(
     alone as an accepted empty catalog. Storage cannot infer acceptance from an
     empty sequence.
 
-    Inputs are fully validated and serialized before BEGIN IMMEDIATE. Duplicate
+    Detached SQL values are fully validated before BEGIN IMMEDIATE; insertion
+    uses those same prepared values without rereading caller-owned fields. Duplicate
     offering IDs are left to the composite primary key so the write rolls back.
     A successful rollback leaves no rows from the attempt.
 
@@ -188,9 +189,10 @@ def write_snapshot(
             "write_snapshot refuses to join a caller-owned transaction"
         )
     _require_foreign_keys(connection)
-    started, completed, location, metadata_json, rows = _prepare_write(
+    snapshot_values, rows = _prepare_write(
         provider, started_at, completed_at, source, observations,
     )
+    provider, started, completed, location, metadata_json = snapshot_values
     acquired = False
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -199,7 +201,7 @@ def write_snapshot(
             "INSERT INTO snapshots ("
             "provider, started_at, completed_at, source_url, source_metadata_json"
             ") VALUES (?, ?, ?, ?, ?)",
-            (provider, started, completed, location, metadata_json),
+            snapshot_values,
         )
         snapshot_id = cursor.lastrowid
         for row in rows:
@@ -504,6 +506,65 @@ def _table_columns(connection: sqlite3.Connection, name: str) -> set[str]:
     }
 
 
+def _capture_text(value, name, *, exact=False):
+    if not isinstance(value, str) or (exact and type(value) is not str):
+        raise TypeError(f"{name} must be {'exact str' if exact else 'a string'}")
+    # Invoke the built-in directly: __str__, equality and encode overrides must
+    # not choose the identity that is checked or the TEXT SQLite receives.
+    return str.__str__(value)
+
+
+def _capture_json_tree(value, active=None, depth=0):
+    """Detach v2 evidence using only exact JSON types, without copy hooks.
+
+    Finalizers may change caller-owned containers while capture runs. The result
+    need not be an atomic view of the caller: the *captured* candidate is what is
+    subsequently validated. No mutable caller reference escapes this function.
+    """
+    kind = type(value)
+    if kind in (type(None), bool, str, int, Decimal):
+        return value
+    if kind not in (dict, list):
+        raise TypeError("v2 evidence must use exact JSON evidence types")
+    if depth >= MAX_JSON_DEPTH:
+        raise ValueError("JSON evidence exceeds maximum nesting depth")
+    if active is None:
+        active = set()
+    identity = id(value)
+    if identity in active:
+        raise ValueError("JSON evidence cannot contain cycles")
+    active.add(identity)
+    try:
+        if kind is list:
+            return [_capture_json_tree(v, active, depth + 1) for v in value]
+        result = {}
+        for key, child in value.items():
+            if type(key) is not str:
+                raise TypeError("v2 evidence keys must be exact strings")
+            result[key] = _capture_json_tree(child, active, depth + 1)
+        return result
+    finally:
+        active.remove(identity)
+
+
+def _capture_json(value, *, exact=False):
+    return _encode_json(_capture_json_tree(value) if exact else value)
+
+
+def _capture_source(source, *, public):
+    if not isinstance(source, SourceMetadata) or (public and type(source) is not SourceMetadata):
+        raise TypeError("source must be SourceMetadata")
+    location = _capture_text(source.location, "source location", exact=public)
+    metadata = _capture_json(source.metadata, exact=public)
+    return location, metadata
+
+
+def _capture_timestamp(value, *, evidence_only):
+    if evidence_only and (type(value) is not datetime or type(value.tzinfo) is not timezone):
+        raise TypeError("v2 timestamp must be exact datetime with exact timezone")
+    return _encode_timestamp(value)
+
+
 def _prepare_write(
     provider: str,
     started_at: datetime,
@@ -511,57 +572,91 @@ def _prepare_write(
     source: SourceMetadata,
     observations: Sequence[CatalogObservation],
 ):
-    if not isinstance(provider, str):
-        raise TypeError("provider must be a string")
+    """Capture complete SQL values, validate them, then return only those values.
+
+    Snapshot authority chooses the contract. Claimed observation identities are
+    retained until checked, rather than replaced by the snapshot's identity.
+    Capture can run caller callbacks in legacy codecs or same-thread finalizers;
+    validation and insertion never reread those caller-owned objects. This is a
+    persistence invariant, not isolation from unrestricted in-process code.
+    """
+    public = is_reserved_stream(provider)
+    provider = _capture_text(provider, "provider")
+    location, metadata_json = _capture_source(source, public=public)
+    captured_source = SourceMetadata(location, _decode_json(metadata_json))
+    _validate_provider_source(provider, captured_source)
+    evidence_only = public and captured_source.metadata['source_contract'] == 'cheaper-inference-public-models-v2'
+    started = _capture_timestamp(started_at, evidence_only=evidence_only)
+    completed = _capture_timestamp(completed_at, evidence_only=evidence_only)
+    snapshot_values = (provider, started, completed, location, metadata_json)
+    if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
+        raise TypeError("observations must be a sequence")
+    candidates = []
+    for item in observations:
+        if not isinstance(item, CatalogObservation) or (evidence_only and type(item) is not CatalogObservation):
+            raise TypeError("observations must contain CatalogObservation values")
+        claimed = item.provider
+        is_reserved_stream(claimed)  # Preserve BL-2's reserved subclass rejection.
+        claimed = _capture_text(claimed, "observation provider", exact=evidence_only)
+        item_location, item_metadata = _capture_source(item.source, public=public)
+        offering = _capture_text(item.offering_id, "offering_id", exact=evidence_only)
+        observed = _capture_timestamp(item.observed_at, evidence_only=evidence_only)
+        input_price = _encode_money(item.input_usd_per_million)
+        output_price = _encode_money(item.output_usd_per_million)
+        conditions = _capture_json(item.unsupported_pricing, exact=evidence_only)
+        raw = _capture_json(item.raw_offering, exact=evidence_only)
+        quote = item.advertised_quote
+        # Do not serialize hostile quote objects for v2, or discard a forbidden
+        # captured value. Presence itself is invalid, regardless of equality.
+        if evidence_only and quote is not None:
+            raise ValueError("v2 observations cannot contain an advertised quote")
+        if not public and quote is not None:
+            raise ValueError('legacy providers cannot carry advertised quotes')
+        if quote is not None and (not isinstance(quote, AdvertisedTokenQuote)
+                                  or not isinstance(quote.basis, AdvertisedQuoteBasis)):
+            raise TypeError("invalid quote type")
+        quote_json = _encode_quote(quote)
+        candidates.append((claimed, item_location, item_metadata,
+                           (offering, observed, input_price, output_price, conditions, raw, quote_json)))
+    candidates = tuple(candidates)
+
+    # All values below are detached SQL TEXT/NULL. Validate the exact serialized
+    # candidate, including relationships and evidence, before any BEGIN.
     if not provider.strip():
         raise ValueError("provider must be nonblank")
     _require_sqlite_text(provider, "provider")
-    if not isinstance(source, SourceMetadata):
-        raise TypeError("source must be SourceMetadata")
-    if not isinstance(source.location, str):
-        raise TypeError("source location must be a string")
-    if source.location == "":
+    if location == "":
         raise ValueError("source location must be nonempty")
-    _require_sqlite_text(source.location, "source location")
-    started = _encode_timestamp(started_at)
-    completed = _encode_timestamp(completed_at)
+    _require_sqlite_text(location, "source location")
     if completed < started:
         raise ValueError("completed_at must be at or after started_at")
-    metadata_json = _encode_json(source.metadata)
-    _validate_provider_source(provider, source)
-    if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
-        raise TypeError("observations must be a sequence")
+    observed_times = set()
     rows = []
-    observed_at = set()
-    for item in observations:
-        if not isinstance(item, CatalogObservation):
-            raise TypeError("observations must contain CatalogObservation values")
-        _require_offering_identity(item.offering_id)
-        if item.provider != provider:
+    for claimed, item_location, item_metadata, row in candidates:
+        if claimed != provider:
             raise ValueError("observation provider must equal snapshot provider")
-        if not isinstance(item.source, SourceMetadata):
-            raise TypeError("observation source must be SourceMetadata")
-        if item.source.location != source.location:
+        if (item_location, item_metadata) != (location, metadata_json):
             raise ValueError("observation source must equal snapshot source")
-        if _encode_json(item.source.metadata) != metadata_json:
-            raise ValueError("observation source must equal snapshot source")
-        _validate_quote_contract(item, source)
-        observed = _encode_timestamp(item.observed_at)
+        offering, observed, input_price, output_price, conditions, raw, quote_json = row
+        _require_offering_identity(offering)
         if observed < started or observed > completed:
             raise ValueError("observation time must be within the snapshot interval")
-        observed_at.add(observed)
-        rows.append((
-            item.offering_id,
-            observed,
-            _encode_money(item.input_usd_per_million),
-            _encode_money(item.output_usd_per_million),
-            _encode_json(item.unsupported_pricing),
-            _encode_json(item.raw_offering),
-            _encode_quote(item.advertised_quote),
-        ))
-    if rows and len(observed_at) != 1:
+        item = CatalogObservation(
+            claimed, offering, _decode_timestamp(observed),
+            SourceMetadata(item_location, _decode_json(item_metadata)),
+            _decode_money(input_price), _decode_money(output_price),
+            _decode_json(conditions), _decode_json(raw), _decode_quote(quote_json),
+        )
+        # Never let a caller-controlled observation provider select validation.
+        if provider == STREAM_ID:
+            validate_public_observation(item, source=captured_source)
+        elif item.advertised_quote is not None:
+            raise ValueError('legacy providers cannot carry advertised quotes')
+        observed_times.add(observed)
+        rows.append(row)
+    if rows and len(observed_times) != 1:
         raise ValueError("observations must share one UTC observation time")
-    return started, completed, source.location, metadata_json, rows
+    return snapshot_values, tuple(rows)
 
 
 def _require_offering_identity(value: str) -> None:

@@ -17,17 +17,52 @@ It does not evaluate model quality, choose or recommend models, route inference,
 ### Implemented library support
 
 The Python library supports OpenRouter catalog history and a separate Cheaper
-Inference **public Standard advertised-price** history. Exact offering IDs remain
+Inference **public catalog evidence and historical advertised-price** history. Exact offering IDs remain
 distinct, including case and suffixes. There is no automatic model selection,
 alias matching, routing, or switching. The broader features and commands below
 are plans, not a delivered command-line interface.
 
-Cheaper Inference results describe observed advertised base token prices. They
-do not guarantee a final request charge, availability, savings, or free execution.
-Standard prices are not compared with ZDR prices. A true ZDR flag without an
-explicit route retains the row as evidence-only; a ZDR route rejects the whole
-Standard catalog. Media, unknown conditions, and unsupported rows retain their
-presence without inventing numeric token quotes. Unknown prices are not zero.
+`cheaper_inference.public.standard` identifies the acquisition view/stream.
+Current v2 raw evidence may include pricing scopes or service tiers other than
+that nominal Standard acquisition view. Revision 3 does **not numerically
+certify** any of those scopes or establish authoritative current Standard prices.
+
+Exact metadata selects one of two contracts; mixed combinations are rejected
+without fallback or inference from row shape:
+
+- Historical `cheaper-inference-public-models-v1` with
+  `ci-advertised-base-token-v1` preserves the Tranche F interpretation. Its
+  eligible quotes describe observed advertised base token rates, with no guarantee
+  of final charges, availability, savings, or free execution. A true ZDR flag
+  without an explicit route retains an evidence-only row; a non-null ZDR route
+  rejects the whole v1 Standard catalog. Unknown prices are not zero.
+- Current `cheaper-inference-public-models-v2` with
+  `ci-advertised-evidence-only-v2` retains complete raw evidence and deliberately
+  prohibits **all numeric pricing**. Every observation has `advertised_quote=None`,
+  no legacy numeric prices, and reason `numeric_scope_semantics_unestablished`.
+  There is no full, partial, or both-unknown quote object. Top-level prices,
+  scope rates, service tiers, ZDR capability, default scope, effective/expiry
+  metadata, rounding and derived rates confer no numeric authority.
+
+This v2 prohibition differs from historical v1 route-based rejection: unfamiliar
+route, condition and pricing/media-unit strings remain exact evidence without
+semantic mapping, conversion or numeric interpretation. V2 requires `endpoint`
+as a string and `supported_endpoints` as an array of strings; neither selects a
+routing endpoint or price. Wrong structural types are rejected. Unknown row and
+nested scope fields remain evidence; scope contents have no inferred precedence
+or closed semantic allowlist.
+Historical v1 records remain readable under their original policy. A transition
+between v1 and v2 produces an unsupported-quote comparison/event barrier; stale
+v1 prices and decrease events cannot become current v2 numeric quotes.
+
+The retained G1b Attempt 01 body is an offline regression fixture. Revision 3
+does not justify Attempt 02. A future numeric-price policy requires new semantic
+evidence and separate architecture, review and authorization. Tranche G remains
+incomplete; Outcome B and restored numeric Standard pricing are not established.
+Under v2, a successful compatible runner execution can mechanically yield
+A=true, B=false, C=true. C is determined by the policy's quote prohibition,
+not new evidence of provider numeric-price absence. B is unreachable under v2,
+so a v2 compatibility run cannot satisfy the G1 A+B gate or authorize Attempt 02.
 
 Use `providers.cheaper_inference.parse_catalog` for supplied JSON,
 `cheaper_inference_acquisition.scan_cheaper_inference` for one explicitly invoked

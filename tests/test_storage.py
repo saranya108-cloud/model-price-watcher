@@ -289,6 +289,577 @@ class MigrationTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def _public_cases(self):
+        import json
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, V1_SOURCE_METADATA)
+        v1, v2 = (SourceMetadata(SOURCE_URL, dict(m)) for m in (V1_SOURCE_METADATA, SOURCE_METADATA))
+        model = dict(id='A', model_type='text', input_per_million='1.25',
+                     output_per_million='10', discount_percent='0')
+        old, = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v1).observations
+        model.update(endpoint='/v1/responses', supported_endpoints=[])
+        raw = json.dumps({'models': [model]})
+        current, = parse_ci(raw, observed_at=OBSERVED, source=v2).observations
+        return v1, v2, old, current, raw
+
+    def _assert_write_rejected_before_begin(self, rows, *, error=TypeError, **changes):
+        before = tuple(self.connection.iterdump())
+        begins, statements = [], []
+        def authorizer(action, arg1, *_rest):
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == 'BEGIN':
+                begins.append(arg1)
+            return sqlite3.SQLITE_OK
+        self.connection.set_authorizer(authorizer)
+        self.connection.set_trace_callback(statements.append)
+        try:
+            with self.assertRaises(error):
+                self.write(rows, **changes)
+        finally:
+            self.connection.set_authorizer(None)
+            self.connection.set_trace_callback(None)
+        self.assertEqual(begins, [])
+        self.assertFalse(any(sql.startswith('BEGIN') for sql in statements))
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.assertFalse(self.connection.in_transaction)
+
+    def test_v2_snapshot_authority_rejects_lying_observation_providers(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import STREAM_ID
+        class Liar(str):
+            def __eq__(self, other): return False
+            def __ne__(self, other): return False
+        class NonString:
+            def __eq__(self, other): return False
+            def __ne__(self, other): return False
+        _, source, old, current, _ = self._public_cases()
+        self.write()  # Check preservation of already committed data too.
+        for claimed in ('openrouter', Liar('openrouter'), NonString()):
+            for changes in (
+                {},
+                dict(input_usd_per_million=Decimal('1.25'), output_usd_per_million=Decimal('10')),
+                dict(advertised_quote=old.advertised_quote),
+                dict(raw_offering={'id': 'B'}, unsupported_pricing={}),
+            ):
+                item = replace(current, provider=claimed, offering_id='B',
+                               raw_offering=dict(current.raw_offering, id='B'))
+                item = replace(item, **changes)
+                for rows in ([item], [current, item]):
+                    with self.subTest(claim=type(claimed).__name__, changes=changes, rows=len(rows)):
+                        self._assert_write_rejected_before_begin(
+                            rows, error=(TypeError, ValueError), provider=STREAM_ID, source=source)
+
+    def test_v2_prepared_identity_and_evidence_must_match(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import STREAM_ID
+        v1, source, old, current, _ = self._public_cases()
+        self.write()
+        cases = (
+            dict(provider='other'), dict(source=v1),
+            dict(source=SourceMetadata('other', dict(source.metadata))),
+            dict(offering_id='B'), dict(raw_offering={'id': 'A'}),
+            dict(unsupported_pricing={}),
+            dict(raw_offering=dict(current.raw_offering, endpoint=[])),
+            dict(input_usd_per_million=Decimal('1.25')),
+            dict(output_usd_per_million=Decimal('10')),
+            dict(advertised_quote=old.advertised_quote),
+        )
+        for changes in cases:
+            for rows in ([replace(current, **changes)], [current, replace(current, **changes)]):
+                with self.subTest(changes=changes, rows=len(rows)):
+                    self._assert_write_rejected_before_begin(
+                        rows, error=(TypeError, ValueError), provider=STREAM_ID, source=source)
+
+    def test_v2_deferred_finalizer_after_validation_cannot_change_inserted_values(self):
+        import gc
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import STREAM_ID
+        # Instrumentation: collect a real cyclic finalizer immediately after the
+        # real observation validator returns. This is deterministic scheduling,
+        # not a claim about unmodified natural-GC timing. No production globals
+        # are monkey-patched by the hostile object itself.
+        effects = ('provider', 'source', 'offering', 'timestamp', 'input', 'output',
+                   'quote', 'conditions', 'raw', 'snapshot-source')
+        for effect in effects:
+            with self.subTest(effect=effect):
+                _, source, old, original, _ = self._public_cases()
+                item = replace(original)
+                calls = []
+                def mutate():
+                    calls.append(effect)
+                    if effect == 'provider': object.__setattr__(item, 'provider', 'openrouter')
+                    elif effect == 'source': object.__setattr__(item, 'source', SourceMetadata('forged', {}))
+                    elif effect == 'offering': object.__setattr__(item, 'offering_id', 'forged')
+                    elif effect == 'timestamp': object.__setattr__(item, 'observed_at', COMPLETED)
+                    elif effect == 'input': object.__setattr__(item, 'input_usd_per_million', Decimal('1.25'))
+                    elif effect == 'output': object.__setattr__(item, 'output_usd_per_million', Decimal('10'))
+                    elif effect == 'quote': object.__setattr__(item, 'advertised_quote', old.advertised_quote)
+                    elif effect == 'conditions': item.unsupported_pricing.clear()
+                    elif effect == 'raw': item.raw_offering.clear()
+                    elif effect == 'snapshot-source': object.__setattr__(source, 'location', 'forged')
+                class Deferred:
+                    def __init__(self): self.cycle = self
+                    def __del__(self): mutate()
+                enabled = gc.isenabled()
+                gc.disable()  # Test scheduling only; production does not disable GC.
+                gc.collect()
+                deferred = Deferred()
+                del deferred
+                validate = storage.validate_public_observation
+                def validate_then_collect(*args, **kwargs):
+                    result = validate(*args, **kwargs)
+                    gc.collect()
+                    return result
+                try:
+                    with patch.object(storage, 'validate_public_observation', validate_then_collect):
+                        snapshot = self.write([item], provider=STREAM_ID, source=source)
+                finally:
+                    gc.collect()
+                    if enabled: gc.enable()
+                self.assertEqual(calls, [effect])
+                row = self.connection.execute('SELECT * FROM observations WHERE snapshot_id=?', (snapshot.id,)).fetchone()
+                self.assertEqual((row['input_per_million'], row['output_per_million'], row['advertised_quote_json']),
+                                 (None, None, None))
+                record, = get_snapshot_observations(self.connection, snapshot.id)
+                self.assertEqual(record.offering_id, 'A')
+                self.assertEqual(record.observed_at, OBSERVED)
+                # Parser-derived originals may share the mutated dictionaries;
+                # derive the expectation afresh, independently of caller state.
+                _, expected_source, _, expected, _ = self._public_cases()
+                self.assertEqual(snapshot.source, expected_source)
+                self.assertEqual(record.conditions, expected.unsupported_pricing)
+                self.assertEqual(record.source_record, expected.raw_offering)
+                self.assertFalse(self.connection.in_transaction)
+
+    def test_v2_capture_rejects_numeric_injection_from_deferred_finalizer(self):
+        import gc
+        from model_price_watcher.providers.cheaper_inference import STREAM_ID
+        # Instrumentation: schedule collection after encoding the observation
+        # timestamp, before capturing numeric/quote fields. The captured invalid
+        # candidate must be rejected, never sanitized into a valid row.
+        for field in ('input_usd_per_million', 'output_usd_per_million', 'advertised_quote'):
+            with self.subTest(field=field):
+                _, source, old, item, _ = self._public_cases()
+                calls = []
+                class Deferred:
+                    def __init__(self): self.cycle = self
+                    def __del__(self):
+                        calls.append(field)
+                        object.__setattr__(item, field,
+                            old.advertised_quote if field == 'advertised_quote' else Decimal('1.25'))
+                enabled = gc.isenabled()
+                gc.disable()
+                gc.collect()
+                deferred = Deferred()
+                del deferred
+                encode = storage._encode_timestamp
+                def encode_then_collect(value):
+                    result = encode(value)
+                    if value is OBSERVED: gc.collect()
+                    return result
+                try:
+                    with patch.object(storage, '_encode_timestamp', encode_then_collect):
+                        self._assert_write_rejected_before_begin(
+                            [item], error=(TypeError, ValueError), provider=STREAM_ID, source=source)
+                finally:
+                    gc.collect()
+                    if enabled: gc.enable()
+                self.assertEqual(calls, [field])
+
+    def test_v2_source_extras_never_execute_copy_hooks(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, STREAM_ID
+        # A copy callback can mutate after quote validation, or install a timestamp
+        # that defers quote mutation until storage normalizes the original item.
+        for entry in ('writer', 'parser'):
+            for hook_kind in ('deepcopy', 'reduce'):
+                for effect in ('quote', 'timestamp'):
+                    with self.subTest(entry=entry, hook=hook_kind, effect=effect):
+                        _, source, old, current, raw = self._public_cases()
+                        item = replace(current, source=source)
+                        fields_before = dict(vars(item))
+                        calls = []
+                        class DeferredDatetime(datetime):
+                            def astimezone(self, tz=None):
+                                calls.append('deferred-timestamp')
+                                object.__setattr__(item, 'advertised_quote', old.advertised_quote)
+                                return super().astimezone(tz)
+                        def mutate():
+                            calls.append(hook_kind)
+                            if effect == 'quote':
+                                object.__setattr__(item, 'advertised_quote', old.advertised_quote)
+                            else:
+                                object.__setattr__(item, 'observed_at', DeferredDatetime(
+                                    2026, 9, 19, 12, 30, tzinfo=timezone.utc))
+                        class DeepcopyHook:
+                            def __deepcopy__(self, memo):
+                                mutate()
+                                return self
+                        class ReduceHook:
+                            def __reduce_ex__(self, protocol):
+                                mutate()
+                                return int, (0,)
+                        hook = DeepcopyHook() if hook_kind == 'deepcopy' else ReduceHook()
+                        object.__setattr__(source, 'extra', hook)
+                        source_before = dict(vars(source))
+                        if entry == 'parser':
+                            parsed = parse_ci(raw, observed_at=OBSERVED, source=source)
+                            self.assertTrue(parsed.accepted)
+                            to_write, = parsed.observations
+                            for copied in (parsed.source, to_write.source):
+                                self.assertEqual(set(vars(copied)), {'location', 'metadata'})
+                                self.assertIsNot(copied, source)
+                                self.assertIsNot(copied.metadata, source.metadata)
+                                self.assertEqual(copied, source)
+                            self.assertIsNot(parsed.source.metadata, to_write.source.metadata)
+                        else:
+                            to_write = item
+                        snapshot = self.write([to_write], provider=STREAM_ID, source=source)
+                        self.assertEqual(calls, [])
+                        self.assertEqual(vars(item), fields_before)
+                        self.assertIs(item.observed_at, current.observed_at)
+                        self.assertIsNone(item.advertised_quote)
+                        self.assertEqual(vars(source), source_before)
+                        self.assertIs(source.extra, hook)
+                        record, = get_snapshot_observations(self.connection, snapshot.id)
+                        self.assertEqual((record.advertised_quote, record.input_per_million,
+                                          record.output_per_million), (None, None, None))
+                        self.assertEqual(record.observed_at, OBSERVED)
+                        self.assertEqual(record.conditions, current.unsupported_pricing)
+                        self.assertEqual(record.source_record, current.raw_offering)
+                        self.assertFalse(self.connection.in_transaction)
+        self.assertEqual(self.counts(), (8, 8))
+        self.assertEqual(self.connection.execute(
+            'SELECT COUNT(*) FROM observations WHERE advertised_quote_json IS NOT NULL').fetchone()[0], 0)
+
+    def test_reserved_stream_detection_uses_content_without_callbacks(self):
+        from model_price_watcher.providers.cheaper_inference import is_reserved_stream, STREAM_ID
+        calls = []
+        class HostileString(str):
+            def __eq__(self, other): calls.append('eq'); return False
+            def __ne__(self, other): calls.append('ne'); return False
+            def startswith(self, *args): calls.append('startswith'); return False
+            def __str__(self): calls.append('str'); return 'openrouter'
+        for content in ('cheaper_inference', 'cheaper_inference.',
+                        'cheaper_inference.other', STREAM_ID):
+            with self.subTest(content=content), self.assertRaises(TypeError):
+                is_reserved_stream(HostileString(content))
+        for content in ('openrouter', 'cheaper_inferenceX', 'cheaper_inference_public', ''):
+            with self.subTest(content=content):
+                self.assertFalse(is_reserved_stream(HostileString(content)))
+        self.assertFalse(is_reserved_stream(None))
+        self.assertEqual(calls, [])
+
+    def test_reserved_provider_subclasses_rejected_at_both_write_boundaries(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import STREAM_ID
+        class PlainString(str):
+            pass
+        class LyingString(str):
+            def __eq__(self, other): return False
+            def __ne__(self, other): return False
+            def startswith(self, *args): return False
+            def __str__(self): return 'openrouter'
+        v1, v2, old, current, _ = self._public_cases()
+        self.write()  # Rejections must preserve existing committed contents too.
+        for source, original in ((v1, old), (v2, current)):
+            for content in ('cheaper_inference', 'cheaper_inference.',
+                            'cheaper_inference.other', STREAM_ID):
+                for string_type in (PlainString, LyingString):
+                    provider = string_type(content)
+                    with self.subTest(policy=source.metadata['interpretation_policy'],
+                                      content=content, kind=string_type.__name__, boundary='snapshot'):
+                        self._assert_write_rejected_before_begin([], provider=provider, source=source)
+                    # Same-content plain subclasses reach observation dispatch without
+                    # needing lying equality. Lying variants also evade membership checks.
+                    if string_type is LyingString or content == STREAM_ID:
+                        item = replace(original, provider=provider, offering_id='B',
+                                       raw_offering=dict(original.raw_offering, id='B'), advertised_quote=None,
+                                       input_usd_per_million=Decimal('1.25'),
+                                       output_usd_per_million=Decimal('10'))
+                        for rows in ([item], [original, item]):
+                            with self.subTest(policy=source.metadata['interpretation_policy'],
+                                              content=content, kind=string_type.__name__,
+                                              boundary='observation', position=len(rows)):
+                                self._assert_write_rejected_before_begin(
+                                    rows, provider=STREAM_ID, source=source)
+                        if string_type is LyingString:
+                            with self.subTest(policy=source.metadata['interpretation_policy'],
+                                              content=content, boundary='both'):
+                                self._assert_write_rejected_before_begin(
+                                    [item], provider=provider, source=source)
+        self.assertEqual(self.counts(), (1, 1))
+
+    def test_exact_provider_namespace_controls(self):
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import is_reserved_stream, STREAM_ID
+        v1, v2, old, current, _ = self._public_cases()
+        for source, item in ((v1, old), (v2, current)):
+            self.assertTrue(is_reserved_stream(STREAM_ID))
+            snapshot = self.write([item], provider=STREAM_ID, source=source)
+            record, = get_snapshot_observations(self.connection, snapshot.id)
+            self.assertEqual(record.advertised_quote, item.advertised_quote)
+            for content in ('cheaper_inference', 'cheaper_inference.', 'cheaper_inference.other'):
+                with self.subTest(content=content, source=source):
+                    self.assertTrue(is_reserved_stream(content))
+                    self._assert_write_rejected_before_begin(
+                        [], error=ValueError, provider=content, source=source)
+        for content in ('openrouter', 'cheaper_inferenceX', 'cheaper_inference_public'):
+            with self.subTest(content=content):
+                self.assertFalse(is_reserved_stream(content))
+                snapshot = self.write([replace(self.observation(), provider=content)], provider=content)
+                record, = get_snapshot_observations(self.connection, snapshot.id)
+                self.assertEqual((record.input_per_million, record.output_per_million),
+                                 (Decimal('1.25'), Decimal('2.5')))
+
+    def test_v1_custom_timezone_and_datetime_subclass_writes_retain_quotes(self):
+        import json
+        from dataclasses import replace
+        from datetime import tzinfo
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, STREAM_ID
+        v1, _, old, _, _ = self._public_cases()
+        class LegacyZone(tzinfo):
+            def utcoffset(self, value): return timedelta(hours=1)
+            def dst(self, value): return timedelta(0)
+        class LegacyDatetime(datetime):
+            def astimezone(self, tz=None): return super().astimezone(tz)
+        stamps = (datetime(2026, 9, 19, 13, 30, tzinfo=LegacyZone()),
+                  LegacyDatetime(2026, 9, 19, 12, 30, tzinfo=timezone.utc),
+                  LegacyDatetime(2026, 9, 19, 13, 30, tzinfo=LegacyZone()))
+        for stamp in stamps:
+            for boundary in ('parsed', 'direct-writer'):
+                with self.subTest(kind=type(stamp).__name__, boundary=boundary):
+                    parsed = parse_ci(json.dumps({'models': [old.raw_offering]}),
+                                      observed_at=stamp, source=v1)
+                    self.assertTrue(parsed.accepted)
+                    item, = parsed.observations
+                    if boundary == 'direct-writer':
+                        item = replace(item, observed_at=stamp)
+                    snapshot = self.write([item], provider=STREAM_ID, source=v1)
+                    record, = get_snapshot_observations(self.connection, snapshot.id)
+                    self.assertEqual(record.observed_at, OBSERVED)
+                    self.assertEqual(record.advertised_quote, old.advertised_quote)
+                    self.assertEqual((record.advertised_quote.input_usd_per_million,
+                                      record.advertised_quote.output_usd_per_million),
+                                     (Decimal('1.25'), Decimal('10')))
+                    self.assertFalse(self.connection.in_transaction)
+        self.assertEqual(self.counts(), (6, 6))
+
+    def test_v1_source_extra_deepcopy_behavior_is_preserved(self):
+        import json
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, STREAM_ID
+        v1, _, old, _, _ = self._public_cases()
+        calls = []
+        class LegacyHook:
+            def __deepcopy__(self, memo):
+                calls.append('copy')
+                return self
+        object.__setattr__(v1, 'extra', LegacyHook())
+        parsed = parse_ci(json.dumps({'models': [old.raw_offering]}), observed_at=OBSERVED, source=v1)
+        self.assertTrue(parsed.accepted)
+        item, = parsed.observations
+        self.assertTrue(calls)
+        self.assertIs(parsed.source.extra, v1.extra)
+        self.assertIs(item.source.extra, v1.extra)
+        snapshot = self.write([item], provider=STREAM_ID, source=v1)
+        record, = get_snapshot_observations(self.connection, snapshot.id)
+        self.assertEqual(record.advertised_quote, old.advertised_quote)
+
+    def test_v2_timestamp_mutations_rejected_before_begin(self):
+        import json
+        from dataclasses import replace
+        from datetime import tzinfo
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog as parse_ci, validate_public_observation,
+            SOURCE_URL, SOURCE_METADATA, V1_SOURCE_METADATA, STREAM_ID)
+        v1, v2 = (SourceMetadata(SOURCE_URL, dict(m)) for m in (V1_SOURCE_METADATA, SOURCE_METADATA))
+        model = dict(id='A', model_type='text', input_per_million='1.25', output_per_million='10', discount_percent='0')
+        quote = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v1).observations[0].advertised_quote
+        model.update(endpoint='/v1/responses', supported_endpoints=[])
+        current = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v2).observations[0]
+        self.write()
+        before = tuple(self.connection.iterdump())
+        # Delayed triggers target storage encoding after provider normalization.
+        for kind, trigger in (('tzinfo', 1), ('tzinfo', 3),
+                              ('datetime-offset', 1), ('datetime-offset', 2),
+                              ('datetime-normalize', 1), ('datetime-normalize', 2),
+                              ('datetime-attribute', 1)):
+            for boundary in ('provider', 'writer'):
+                with self.subTest(kind=kind, trigger=trigger, boundary=boundary):
+                    calls = []
+                    def mutate(name):
+                        calls.append(name)
+                        if len(calls) == trigger:
+                            object.__setattr__(item, 'advertised_quote', quote)
+                    class MutatingZone(tzinfo):
+                        def utcoffset(self, value):
+                            mutate('utcoffset')
+                            return timedelta(0)
+                        def dst(self, value):
+                            mutate('dst')
+                            return timedelta(0)
+                        def tzname(self, value):
+                            mutate('tzname')
+                            return 'hostile'
+                    class OffsetDatetime(datetime):
+                        def utcoffset(self):
+                            mutate('utcoffset')
+                            return super().utcoffset()
+                    class NormalizeDatetime(datetime):
+                        def astimezone(self, tz=None):
+                            mutate('astimezone')
+                            return super().astimezone(tz)
+                    class AttributeDatetime(datetime):
+                        def __getattribute__(self, name):
+                            if name == 'tzinfo':
+                                mutate('tzinfo')
+                            return super().__getattribute__(name)
+                    stamp_type = {'tzinfo': datetime, 'datetime-offset': OffsetDatetime,
+                                  'datetime-normalize': NormalizeDatetime,
+                                  'datetime-attribute': AttributeDatetime}[kind]
+                    stamp = stamp_type(2026, 9, 19, 12, 30,
+                                       tzinfo=MutatingZone() if kind == 'tzinfo' else timezone.utc)
+                    item = replace(current, observed_at=stamp)
+                    begins, statements = [], []
+                    def authorizer(action, arg1, *_rest):
+                        if action == sqlite3.SQLITE_TRANSACTION and arg1 == 'BEGIN':
+                            begins.append(arg1)
+                        return sqlite3.SQLITE_OK
+                    self.connection.set_authorizer(authorizer)
+                    self.connection.set_trace_callback(statements.append)
+                    try:
+                        with self.assertRaises(TypeError):
+                            if boundary == 'provider':
+                                validate_public_observation(item, source=v2)
+                            else:
+                                self.write([item], provider=STREAM_ID, source=v2)
+                    finally:
+                        self.connection.set_authorizer(None)
+                        self.connection.set_trace_callback(None)
+                    self.assertEqual(calls, [])
+                    self.assertIsNone(item.advertised_quote)
+                    self.assertIs(item.observed_at, stamp)
+                    self.assertEqual(begins, [])
+                    self.assertFalse(any(sql.startswith('BEGIN') for sql in statements))
+                    self.assertEqual(tuple(self.connection.iterdump()), before)
+                    self.assertEqual(self.counts(), (1, 1))
+                    self.assertEqual(self.connection.execute(
+                        'SELECT COUNT(*) FROM observations WHERE advertised_quote_json IS NOT NULL').fetchone()[0], 0)
+                    self.assertFalse(self.connection.in_transaction)
+                    self.assertEqual(self.connection.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+                    self.assertEqual(get_successful_history(self.connection, STREAM_ID), ())
+
+    def test_v2_exact_builtin_timestamp_roundtrip_remains_evidence_only(self):
+        import json
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog as parse_ci, validate_public_observation, SOURCE_URL, SOURCE_METADATA, STREAM_ID)
+        source = SourceMetadata(SOURCE_URL, dict(SOURCE_METADATA))
+        raw = json.dumps({'models': [dict(id='A', model_type='text', input_per_million='1.25',
+            output_per_million='10', discount_percent='0', endpoint='/v1/responses', supported_endpoints=[])]})
+        fixed = datetime(2026, 9, 19, 18, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        for stamp in (OBSERVED, fixed):
+            with self.subTest(stamp=stamp):
+                parsed = parse_ci(raw, observed_at=stamp, source=source)
+                self.assertTrue(parsed.accepted)
+                item, = parsed.observations
+                self.assertIs(type(item.observed_at), datetime)
+                self.assertIs(item.observed_at.tzinfo, timezone.utc)
+                # Direct writer callers may retain an exact fixed-offset datetime.
+                item = replace(item, observed_at=stamp)
+                validate_public_observation(item, source=source)
+                snapshot = self.write([item], provider=STREAM_ID, source=source)
+                record, = get_snapshot_observations(self.connection, snapshot.id)
+                self.assertEqual(record.observed_at, OBSERVED)
+                self.assertIs(type(record.observed_at), datetime)
+                self.assertIs(type(record.observed_at.tzinfo), timezone)
+                self.assertEqual((record.advertised_quote, record.input_per_million, record.output_per_million),
+                                 (None, None, None))
+                self.assertEqual(record.conditions, item.unsupported_pricing)
+                self.assertEqual(record.source_record, item.raw_offering)
+        self.assertEqual(self.counts(), (2, 2))
+        self.assertEqual(len(get_successful_history(self.connection, STREAM_ID)), 2)
+
+    def test_v2_numeric_forgery_rejected_before_begin_and_by_all_readers(self):
+        import json
+        from dataclasses import replace
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, V1_SOURCE_METADATA, STREAM_ID)
+        v1, v2 = (SourceMetadata(SOURCE_URL, m) for m in (V1_SOURCE_METADATA, SOURCE_METADATA))
+        model = dict(id='A', model_type='text', input_per_million='1.25', output_per_million='10', discount_percent='0')
+        old = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v1).observations[0]
+        model.update(endpoint='/v1/chat/completions', supported_endpoints=[])
+        current = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v2).observations[0]
+        quote = old.advertised_quote
+        class NoneLikeQuote:
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+            def __bool__(self): return False
+        class EqualString(str):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        # Full, partial, both-unknown and policy-relabeled quote objects are all forbidden.
+        for q in (quote, replace(quote, output_usd_per_million=None),
+                  replace(quote, input_usd_per_million=None, output_usd_per_million=None),
+                  replace(quote, input_usd_per_million=Decimal(0), output_usd_per_million=Decimal(0)),
+                  replace(quote, basis=replace(quote.basis, interpretation_policy=v2.metadata['interpretation_policy'])),
+                  replace(quote, basis=replace(quote.basis, unit=EqualString('forged-unit'))),
+                  NoneLikeQuote(), False, object()):
+            with self.subTest(quote=q), _deny_sql_begin(self.connection), self.assertRaises(ValueError):
+                self.write([replace(current, advertised_quote=q)], provider=STREAM_ID, source=v2)
+        for change in ({'input_usd_per_million': Decimal(1)}, {'output_usd_per_million': Decimal(1)}):
+            with _deny_sql_begin(self.connection), self.assertRaises(ValueError):
+                self.write([replace(current, **change)], provider=STREAM_ID, source=v2)
+        self.assertEqual(self.counts(), (0, 0))
+        historical = self.write([old], provider=STREAM_ID, source=v1)
+        encoded = self.connection.execute('SELECT advertised_quote_json FROM observations').fetchone()[0]
+        snapshot = self.write([current], provider=STREAM_ID, source=v2)
+        self.assertEqual(get_snapshot_observations(self.connection, historical.id)[0].advertised_quote, quote)
+        record, = get_snapshot_observations(self.connection, snapshot.id)
+        self.assertEqual((record.advertised_quote, record.input_per_million, record.output_per_million), (None, None, None))
+        self.assertEqual(record.conditions, current.unsupported_pricing)
+        self.assertEqual(record.source_record, current.raw_offering)
+        self.assertEqual(self.connection.execute('PRAGMA user_version').fetchone()[0], 2)
+        readers = [lambda: get_snapshot_observations(self.connection, snapshot.id),
+                   lambda: get_current_observations(self.connection, STREAM_ID),
+                   lambda: get_successful_history(self.connection, STREAM_ID),
+                   lambda: get_offering_history(self.connection, provider=STREAM_ID, offering_id='A')]
+        data = json.loads(encoded)
+        partial = dict(data, output_usd_per_million=None)
+        unknown = dict(partial, input_usd_per_million=None)
+        relabeled = dict(data, basis=dict(data['basis'], interpretation_policy=v2.metadata['interpretation_policy']))
+        for forged in (data, partial, unknown, relabeled):
+            with self.subTest(forged=forged):
+                self.connection.execute('UPDATE observations SET advertised_quote_json=? WHERE snapshot_id=?',
+                                        (json.dumps(forged), snapshot.id))
+                for reader in readers:
+                    with self.assertRaises(StorageError):
+                        reader()
+        self.connection.execute('UPDATE observations SET advertised_quote_json=NULL WHERE snapshot_id=?', (snapshot.id,))
+        self.assertIsNone(readers[0]()[0].advertised_quote)
+        self.assertEqual(len(get_successful_history(self.connection, STREAM_ID)), 2)
+
+    def test_v2_equality_overriding_quote_cannot_be_persisted(self):
+        import json
+        from dataclasses import replace
+        from model_price_watcher.models import AdvertisedTokenQuote
+        from model_price_watcher.providers.cheaper_inference import (
+            parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, V1_SOURCE_METADATA, STREAM_ID)
+        class EqualToNoneQuote(AdvertisedTokenQuote):
+            def __eq__(self, other): return True
+            def __ne__(self, other): return False
+        v1, v2 = (SourceMetadata(SOURCE_URL, dict(m)) for m in (V1_SOURCE_METADATA, SOURCE_METADATA))
+        model = dict(id='A', model_type='text', input_per_million='1.25', output_per_million='10', discount_percent='0')
+        quote = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v1).observations[0].advertised_quote
+        model.update(endpoint='/v1/responses', supported_endpoints=['future-endpoint'])
+        current = parse_ci(json.dumps({'models': [model]}), observed_at=OBSERVED, source=v2).observations[0]
+        for amounts in ((Decimal('1.25'), Decimal('10')), (Decimal('1.25'), None), (None, None)):
+            hostile = EqualToNoneQuote(quote.basis, *amounts)
+            self.assertTrue(hostile == None)  # demonstrates the adversarial equality behavior
+            with self.subTest(amounts=amounts):
+                self._assert_write_rejected_before_begin(
+                    [replace(current, advertised_quote=hostile)], error=ValueError, provider=STREAM_ID, source=v2)
+        self.assertEqual(self.counts(), (0, 0))
+
     def test_version_two_has_nullable_quote_column(self):
         columns = {r[1]: r for r in self.connection.execute('PRAGMA table_xinfo(observations)')}
         self.assertEqual(self.connection.execute('PRAGMA user_version').fetchone()[0], 2)
@@ -314,7 +885,7 @@ class StorageTests(unittest.TestCase):
 
     def test_advertised_roundtrip_and_missing_quote_corruption(self):
         import json
-        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, STREAM_ID
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, V1_SOURCE_METADATA as SOURCE_METADATA, STREAM_ID
         source = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
         raw = {'models': [dict(id='A', model_type='text', input_per_million='1.25', output_per_million='10', discount_percent='0', input_token_price_threshold=100),
                           dict(id='B', model_type='text', input_per_million='1', output_per_million='2', discount_percent='0', zero_data_retention=True)]}
@@ -329,7 +900,7 @@ class StorageTests(unittest.TestCase):
 
     def test_fixed_golden_quote_corruption_and_every_reader(self):
         import json
-        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, STREAM_ID
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, V1_SOURCE_METADATA as SOURCE_METADATA, STREAM_ID
         source = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
         raw = '{"models":[{"id":"A","model_type":"text","input_per_million":"1.25","output_per_million":"10","discount_percent":"0"}]}'
         parsed = parse_ci(raw, observed_at=OBSERVED, source=source)
@@ -365,7 +936,7 @@ class StorageTests(unittest.TestCase):
     def test_reserved_direct_contracts_and_deep_numeric_roundtrip(self):
         import json
         from dataclasses import replace
-        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, SOURCE_METADATA, STREAM_ID
+        from model_price_watcher.providers.cheaper_inference import parse_catalog as parse_ci, SOURCE_URL, V1_SOURCE_METADATA as SOURCE_METADATA, STREAM_ID
         source = SourceMetadata(SOURCE_URL, SOURCE_METADATA)
         base = dict(id='A', model_type='text', input_per_million='1.25', output_per_million='10', discount_percent='0')
         quote_keys = []
