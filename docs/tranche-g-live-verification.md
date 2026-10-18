@@ -47,12 +47,22 @@ interpretation. The quote prohibition uses `is not None`, so equality-overriding
 quote subclasses cannot appear absent. Exact source/evidence types prevent
 equality overrides from defeating metadata dispatch or evidence validation.
 
-The existing SQLite schema and storage/query/detection implementation remain
-unchanged. Direct writers, stored readers and pure history APIs validate the
+The SQLite schema (version 2) and query/detection implementation remain
+unchanged. Storage write preparation was hardened (BL-1–BL-4) without any schema
+change. Direct writers, stored readers and pure history APIs validate the
 declared policy against retained evidence. Forged v2 quotes are rejected. Valid
 v1/v2 history remains readable, but a transition involving v2 is non-comparable
 with `QUOTE_UNSUPPORTED` and clears any prior decrease event. Current selection
 shows the v2 row without borrowing a stale historical v1 numeric quote.
+
+Direct writers of v2 snapshots must supply exact built-in types. `started_at`,
+`completed_at` and every `observed_at` must be an exact `datetime` whose
+`tzinfo` is exactly `datetime.timezone` (for example `timezone.utc`); `zoneinfo`
+or other timezone implementations and `datetime` subclasses are rejected. The
+provider and offering IDs must be exact `str`, the source an exact
+`SourceMetadata`, and each observation an exact `CatalogObservation`. Evidence
+may use only `dict`, `list`, `str`, `int`, `Decimal`, `bool` and `None`; `float`
+is rejected. Anything else is rejected before a transaction begins.
 
 The byte-identical offline fixture
 `tests/fixtures/cheaper_inference_public_catalog_g1b_live_01.json` comes from the

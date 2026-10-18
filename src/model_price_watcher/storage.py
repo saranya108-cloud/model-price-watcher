@@ -175,6 +175,13 @@ def write_snapshot(
     offering IDs are left to the composite primary key so the write rolls back.
     A successful rollback leaves no rows from the attempt.
 
+    For v2 evidence-only snapshots, capture accepts only exact built-in types and
+    runs no caller copy or serialization hooks. Legacy (OpenRouter) and historical
+    v1 observation capture keeps its original, more permissive behavior: subclasses
+    are accepted, and ordinary serialization may invoke caller hooks while values
+    are captured. Reserved Cheaper Inference snapshots (v1 and v2) still require an
+    exact `str` provider and an exact `SourceMetadata` source.
+
     If an exception occurs after the write transaction is acquired, this
     function rolls back when the transaction remains active and re-raises the
     original operation exception. If rollback itself fails, that rollback
