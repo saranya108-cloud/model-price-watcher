@@ -404,18 +404,23 @@ class StorageTests(unittest.TestCase):
                 gc.collect()
                 deferred = Deferred()
                 del deferred
-                validate = storage.validate_public_observation
+                # Gate 1a K.9: patch the name the production call path resolves.
+                from model_price_watcher import legacy_cheaper_inference
+                validate = legacy_cheaper_inference.validate_public_observation
+                invoked = []
                 def validate_then_collect(*args, **kwargs):
                     result = validate(*args, **kwargs)
+                    invoked.append(True)
                     gc.collect()
                     return result
                 try:
-                    with patch.object(storage, 'validate_public_observation', validate_then_collect):
+                    with patch.object(legacy_cheaper_inference, 'validate_public_observation', validate_then_collect):
                         snapshot = self.write([item], provider=STREAM_ID, source=source)
                 finally:
                     gc.collect()
                     if enabled: gc.enable()
                 self.assertEqual(calls, [effect])
+                self.assertEqual(invoked, [True])
                 row = self.connection.execute('SELECT * FROM observations WHERE snapshot_id=?', (snapshot.id,)).fetchone()
                 self.assertEqual((row['input_per_million'], row['output_per_million'], row['advertised_quote_json']),
                                  (None, None, None))

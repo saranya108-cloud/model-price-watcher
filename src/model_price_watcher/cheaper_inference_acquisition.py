@@ -3,13 +3,19 @@ import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from model_price_watcher.acquisition import ScanResult, AcquisitionError
+from model_price_watcher.acquisition import ScanResult, AcquisitionError, ScanProfile, run_scan
 from model_price_watcher.models import SourceMetadata
 from model_price_watcher.providers.cheaper_inference import (
     STREAM_ID, SOURCE_URL, SOURCE_METADATA, parse_catalog,
 )
 from model_price_watcher.storage import StorageError, write_snapshot
 from model_price_watcher.transport import HttpTransport, HttpResponse, TransportError, validate_limits
+
+
+CHEAPER_INFERENCE_PROFILE = ScanProfile(
+    STREAM_ID, SOURCE_URL,
+    ('observation time precedes start', 'completion precedes observation'),
+)
 
 
 def _utc(value):
@@ -93,28 +99,18 @@ def scan_cheaper_inference(connection: sqlite3.Connection, *, transport: HttpTra
     validate_limits(timeout_seconds, max_response_bytes)
     if not callable(clock) or not callable(getattr(transport, 'get', None)):
         raise TypeError('clock and transport must be callable')
-    started = _utc(clock())
-    failure = None
-    try:
-        response = transport.get(SOURCE_URL, headers={'Accept': 'application/json', 'Accept-Encoding': 'identity'},
-                                 timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes)
-    except TransportError as error:
-        failure = error.reason
-    if failure is not None:
-        raise AcquisitionError(failure)
-    text = _decode_response(response, max_response_bytes)
-    observed = _utc(clock())
-    if observed < started:
-        raise ValueError('observation time precedes start')
-    source = SourceMetadata(SOURCE_URL, dict(SOURCE_METADATA))
-    parsed = parse_catalog(text, observed_at=observed, source=source)
-    if not parsed.accepted:
-        raise AcquisitionError('catalog_rejected')
-    if not parsed.observations:
-        raise AcquisitionError('empty_catalog')
-    completed = _utc(clock())
-    if completed < observed:
-        raise ValueError('completion precedes observation')
-    snapshot = write_snapshot(connection, provider=STREAM_ID, started_at=started, completed_at=completed,
-                              source=source, observations=parsed.observations)
-    return ScanResult(snapshot, len(parsed.observations))
+
+    def interpret(text, observed):
+        source = SourceMetadata(SOURCE_URL, dict(SOURCE_METADATA))
+        parsed = parse_catalog(text, observed_at=observed, source=source)
+        if not parsed.accepted:
+            raise AcquisitionError('catalog_rejected')
+        if not parsed.observations:
+            raise AcquisitionError('empty_catalog')
+        return source, parsed.observations, len(parsed.observations)
+
+    return run_scan(connection, profile=CHEAPER_INFERENCE_PROFILE,
+                    headers={'Accept': 'application/json', 'Accept-Encoding': 'identity'},
+                    transport=transport, clock=clock, timeout_seconds=timeout_seconds,
+                    max_response_bytes=max_response_bytes, utc=_utc, decode=_decode_response,
+                    interpret=interpret, write=write_snapshot)

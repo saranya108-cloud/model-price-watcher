@@ -51,6 +51,73 @@ class ScanResult:
     observation_count: int
 
 
+@dataclass(frozen=True)
+class ScanProfile:
+    """Declarative acquisition source: storage identity, fixed URL, ordering texts.
+
+    ``order_messages`` keeps each wrapper's existing clock-ordering ValueError
+    texts (observed-before-started, completed-before-observed). Transitional.
+    """
+
+    provider: str
+    url: str
+    order_messages: tuple[str, str]
+
+
+def run_scan(
+    connection: sqlite3.Connection,
+    *,
+    profile: ScanProfile,
+    headers: dict[str, str],
+    transport: HttpTransport,
+    clock: Callable[[], datetime],
+    timeout_seconds: float,
+    max_response_bytes: int,
+    utc: Callable[[datetime], datetime],
+    decode: Callable[[HttpResponse, int], str],
+    interpret: Callable[[str, datetime], tuple],
+    write: Callable[..., SnapshotRecord],
+) -> ScanResult:
+    """Shared provider-neutral acquisition sequence; one bounded GET, one write.
+
+    started -> fetch -> decode -> observed -> interpret -> completed -> write.
+    Transport failures become AcquisitionError outside the handler, without
+    exception context. Exceptions from decode, interpret and write propagate
+    unchanged; write is the only persistence and runs last, so any earlier
+    failure leaves stored history untouched. Callers own their preconditions.
+    """
+    started_at = utc(clock())
+    failure = None
+    try:
+        response = transport.get(
+            profile.url, headers=headers,
+            timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes,
+        )
+    except TransportError as error:
+        failure = error.reason
+    if failure is not None:
+        raise AcquisitionError(failure)
+    text = decode(response, max_response_bytes)
+    observed_at = utc(clock())
+    if observed_at < started_at:
+        raise ValueError(profile.order_messages[0])
+    source, observations, count = interpret(text, observed_at)
+    completed_at = utc(clock())
+    if completed_at < observed_at:
+        raise ValueError(profile.order_messages[1])
+    snapshot = write(
+        connection, provider=profile.provider, started_at=started_at,
+        completed_at=completed_at, source=source, observations=observations,
+    )
+    return ScanResult(snapshot, count)
+
+
+OPENROUTER_PROFILE = ScanProfile(
+    "openrouter", OPENROUTER_CATALOG_URL,
+    ("observation time precedes scan start", "completion time precedes observation time"),
+)
+
+
 def _utc(value: datetime) -> datetime:
     if not isinstance(value, datetime):
         raise TypeError("clock must return a datetime")
@@ -169,42 +236,33 @@ def scan_openrouter(
         "Accept": "application/json",
         "Accept-Encoding": "identity",
     }
-    started_at = _utc(clock())
-    failure = None
-    try:
-        response = transport.get(
-            OPENROUTER_CATALOG_URL, headers=headers,
-            timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes,
-        )
-    except TransportError as error:
-        failure = error.reason
-    if failure is not None:
-        raise AcquisitionError(failure)
-    text = _decode_response(response, max_response_bytes)
-    # Reject an echoed credential rather than redact or persist source evidence.
-    if api_key in text:
-        raise AcquisitionError("credential_exposure")
-    observed_at = _utc(clock())
-    if observed_at < started_at:
-        raise ValueError("observation time precedes scan start")
-    source = SourceMetadata(OPENROUTER_CATALOG_URL, {"acquisition_contract": _CONTRACT})
-    parsed = parse_catalog(text, observed_at=observed_at, source=source)
-    if parsed.accepted is not True:
-        raise AcquisitionError("catalog_rejected")
-    count = _catalog_count(text, len(parsed.observations), api_key)
-    # Count is trusted only after strict acceptance. Reparse the unchanged text
-    # with final provenance instead of mutating any parser-produced observation.
-    source = SourceMetadata(OPENROUTER_CATALOG_URL, {
-        "acquisition_contract": _CONTRACT, "total_count": count,
-    })
-    parsed = parse_catalog(text, observed_at=observed_at, source=source)
-    if parsed.accepted is not True or len(parsed.observations) != count:
-        raise AcquisitionError("catalog_rejected")
-    completed_at = _utc(clock())
-    if completed_at < observed_at:
-        raise ValueError("completion time precedes observation time")
-    snapshot = write_snapshot(
-        connection, provider="openrouter", started_at=started_at,
-        completed_at=completed_at, source=source, observations=parsed.observations,
+
+    def decode(response, maximum):
+        text = _decode_response(response, maximum)
+        # Reject an echoed credential rather than redact or persist source
+        # evidence, before the observation clock call.
+        if api_key in text:
+            raise AcquisitionError("credential_exposure")
+        return text
+
+    def interpret(text, observed_at):
+        source = SourceMetadata(OPENROUTER_CATALOG_URL, {"acquisition_contract": _CONTRACT})
+        parsed = parse_catalog(text, observed_at=observed_at, source=source)
+        if parsed.accepted is not True:
+            raise AcquisitionError("catalog_rejected")
+        count = _catalog_count(text, len(parsed.observations), api_key)
+        # Count is trusted only after strict acceptance. Reparse the unchanged text
+        # with final provenance instead of mutating any parser-produced observation.
+        source = SourceMetadata(OPENROUTER_CATALOG_URL, {
+            "acquisition_contract": _CONTRACT, "total_count": count,
+        })
+        parsed = parse_catalog(text, observed_at=observed_at, source=source)
+        if parsed.accepted is not True or len(parsed.observations) != count:
+            raise AcquisitionError("catalog_rejected")
+        return source, parsed.observations, count
+
+    return run_scan(
+        connection, profile=OPENROUTER_PROFILE, headers=headers, transport=transport,
+        clock=clock, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes,
+        utc=_utc, decode=decode, interpret=interpret, write=write_snapshot,
     )
-    return ScanResult(snapshot, count)

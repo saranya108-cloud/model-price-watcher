@@ -34,9 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from model_price_watcher.models import CatalogObservation, SourceMetadata, AdvertisedQuoteBasis, AdvertisedTokenQuote
-from model_price_watcher.providers.cheaper_inference import (
-    STREAM_ID, is_reserved_stream, validate_public_source, validate_public_observation,
-)
+from model_price_watcher import contracts
 
 
 SCHEMA_VERSION = 2
@@ -175,12 +173,13 @@ def write_snapshot(
     offering IDs are left to the composite primary key so the write rolls back.
     A successful rollback leaves no rows from the attempt.
 
-    For v2 evidence-only snapshots, capture accepts only exact built-in types and
-    runs no caller copy or serialization hooks. Legacy (OpenRouter) and historical
-    v1 observation capture keeps its original, more permissive behavior: subclasses
-    are accepted, and ordinary serialization may invoke caller hooks while values
-    are captured. Reserved Cheaper Inference snapshots (v1 and v2) still require an
-    exact `str` provider and an exact `SourceMetadata` source.
+    For snapshots under a strict declared contract (including v2 evidence-only),
+    capture accepts only exact built-in types and runs no caller copy or
+    serialization hooks. Unreserved providers and legacy-capture contracts keep
+    the original, more permissive observation capture: subclasses are accepted,
+    and ordinary serialization may invoke caller hooks while values are captured.
+    Snapshots inside any declared namespace still require an exact `str`
+    provider and an exact `SourceMetadata` source.
 
     If an exception occurs after the write transaction is acquired, this
     function rolls back when the transaction remains active and re-raises the
@@ -479,7 +478,7 @@ def _migrate_v1(connection):
             raise StorageError('unexpected schema version during migration')
         _verify_schema(connection, 1)
         for row in connection.execute('SELECT * FROM snapshots ORDER BY id'):
-            if is_reserved_stream(row['provider']):
+            if _reserved_record(row['provider']) is not None:
                 raise StorageError('preexisting reserved namespace prevents migration')
             snapshot = _snapshot_from_row(row)
             records = tuple(_observation_from_row(r, snapshot) for r in connection.execute(
@@ -587,12 +586,14 @@ def _prepare_write(
     validation and insertion never reread those caller-owned objects. This is a
     persistence invariant, not isolation from unrestricted in-process code.
     """
-    public = is_reserved_stream(provider)
+    record = _reserved_record(provider)
+    public = record is not None
     provider = _capture_text(provider, "provider")
     location, metadata_json = _capture_source(source, public=public)
     captured_source = SourceMetadata(location, _decode_json(metadata_json))
-    _validate_provider_source(provider, captured_source)
-    evidence_only = public and captured_source.metadata['source_contract'] == 'cheaper-inference-public-models-v2'
+    contract = None if record is None else _resolve_contract(record, provider, captured_source)
+    evidence_only = contract is not None and contract.capture == contracts.CAPTURE_STRICT
+    quote_forbidden = contract is not None and contract.quote_column == contracts.QUOTE_FORBIDDEN
     started = _capture_timestamp(started_at, evidence_only=evidence_only)
     completed = _capture_timestamp(completed_at, evidence_only=evidence_only)
     snapshot_values = (provider, started, completed, location, metadata_json)
@@ -603,7 +604,7 @@ def _prepare_write(
         if not isinstance(item, CatalogObservation) or (evidence_only and type(item) is not CatalogObservation):
             raise TypeError("observations must contain CatalogObservation values")
         claimed = item.provider
-        is_reserved_stream(claimed)  # Preserve BL-2's reserved subclass rejection.
+        _reserved_record(claimed)  # Preserve BL-2's reserved subclass rejection.
         claimed = _capture_text(claimed, "observation provider", exact=evidence_only)
         item_location, item_metadata = _capture_source(item.source, public=public)
         offering = _capture_text(item.offering_id, "offering_id", exact=evidence_only)
@@ -615,7 +616,7 @@ def _prepare_write(
         quote = item.advertised_quote
         # Do not serialize hostile quote objects for v2, or discard a forbidden
         # captured value. Presence itself is invalid, regardless of equality.
-        if evidence_only and quote is not None:
+        if quote_forbidden and quote is not None:
             raise ValueError("v2 observations cannot contain an advertised quote")
         if not public and quote is not None:
             raise ValueError('legacy providers cannot carry advertised quotes')
@@ -655,10 +656,7 @@ def _prepare_write(
             _decode_json(conditions), _decode_json(raw), _decode_quote(quote_json),
         )
         # Never let a caller-controlled observation provider select validation.
-        if provider == STREAM_ID:
-            validate_public_observation(item, source=captured_source)
-        elif item.advertised_quote is not None:
-            raise ValueError('legacy providers cannot carry advertised quotes')
+        _check_observation_contract(contract, item, captured_source)
         observed_times.add(observed)
         rows.append(row)
     if rows and len(observed_times) != 1:
@@ -725,7 +723,7 @@ def _observation_from_row(row: sqlite3.Row, parent: SnapshotRecord) -> Observati
     except (TypeError, ValueError) as error:
         raise StorageError("malformed offering_id") from error
     quote_json = row['advertised_quote_json'] if 'advertised_quote_json' in row.keys() else None
-    if not is_reserved_stream(parent.provider) and quote_json is not None:
+    if _reserved_record(parent.provider) is None and quote_json is not None:
         raise StorageError('legacy provider cannot carry advertised quote evidence')
     record = ObservationRecord(
         row["snapshot_id"],
@@ -754,19 +752,50 @@ def _validate_shared_times(items):
         raise StorageError('inconsistent per-snapshot observation times')
 
 
+def _reserved_record(provider):
+    try:
+        return contracts.reserved_record(provider)
+    except contracts.RegistryError as error:
+        raise StorageError('invalid provider registry') from error
+
+
+def _resolve_contract(record, provider, source):
+    try:
+        return contracts.resolve_contract(record, provider, source)
+    except contracts.RegistryError as error:
+        raise StorageError('invalid provider registry') from error
+
+
+def _run_legacy(contract, item, source):
+    try:
+        contracts.run_legacy_policy(contract, item, source=source)
+    except contracts.RegistryError as error:
+        raise StorageError('invalid provider registry') from error
+
+
 def _validate_provider_source(provider, source):
-    if is_reserved_stream(provider):
-        if provider != STREAM_ID:
-            raise ValueError('unsupported reserved advertised stream')
-        validate_public_source(source)
+    """Return the declared contract for a reserved provider, or None if unreserved."""
+    record = _reserved_record(provider)
+    if record is None:
+        return None
+    return _resolve_contract(record, provider, source)
+
+
+def _check_observation_contract(contract, item, source):
+    """Shared write (S6) and read (S8) observation contract check."""
+    if contract is not None and contract.legacy_policy is not None:
+        _run_legacy(contract, item, source)
+        return
+    if item.advertised_quote is not None:
+        raise ValueError('legacy providers cannot carry advertised quotes')
+    if (contract is not None and contract.price_columns == contracts.PRICES_FORBIDDEN
+            and (item.input_usd_per_million is not None or item.output_usd_per_million is not None)):
+        raise ValueError('contract forbids numeric price columns')
 
 
 def _validate_quote_contract(item, source):
-    _validate_provider_source(item.provider, source)
-    if item.provider == STREAM_ID:
-        validate_public_observation(item, source=source)
-    elif item.advertised_quote is not None:
-        raise ValueError('legacy providers cannot carry advertised quotes')
+    contract = _validate_provider_source(item.provider, source)
+    _check_observation_contract(contract, item, source)
 
 
 def _encode_quote(quote):
