@@ -12,6 +12,24 @@ You choose the model. Model Price Watcher helps you find the best available pric
 
 It does not evaluate model quality, choose or recommend models, route inference, or automatically switch models or providers.
 
+## Product direction
+
+Model Price Watcher (MPW) is intended to become a public Hermes plugin for finding and comparing AI inference pricing across multiple providers. **The capabilities and commands in this section are planned, not claims about the current implementation.**
+
+MPW should remain a standalone pricing engine. Provider acquisition, pricing semantics, historical records, and comparison logic should stay inside MPW, with the future Hermes plugin consuming a stable MPW interface rather than duplicating that logic.
+
+The intended user experience is simple and decision-oriented: show the price, where to access it, and the conditions that matter for a model the user has chosen. Cross-provider discovery should be the default, with provider-specific filtering and drill-down available.
+
+- `/price <model>` — regular/list input and output pricing across providers.
+- `/discount` — discounted models, discounted price, normal/list price, and provider or access location.
+- `/free` — free models, where to access them, and meaningful usage limits.
+- `/promo` — promotional price, regular/list price, provider, and time in force.
+- `/batch` — batch pricing compared with regular/list pricing.
+- `/deals` — consolidated current deals.
+- `/provider` — list and browse supported providers, then drill into price, discount, free, promo, and batch information for a selected provider.
+
+Implementation details remain open for the upcoming council decision.
+
 ## What it watches
 
 ### Implemented library support
